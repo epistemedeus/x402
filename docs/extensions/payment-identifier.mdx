@@ -16,8 +16,8 @@ The payment-identifier extension provides an idempotency mechanism for x402 paym
 
 1. Server advertises `payment-identifier` extension support in the `PaymentRequired` response
 2. Client generates a unique payment ID and includes it in the `PaymentPayload`
-3. Server caches responses keyed by payment ID (with configurable TTL)
-4. Retry requests with the same payment ID return cached responses without re-processing payment
+3. Server caches responses keyed by payment ID and a fingerprint of the HTTP request (with configurable TTL)
+4. Retry requests with the same payment ID and the same request fingerprint return cached responses without re-processing payment. A different method, path, query, or body with that ID returns `409 Conflict` and must not grant access.
 
 ## Quickstart for Buyers (Clients)
 
@@ -248,22 +248,43 @@ declarePaymentIdentifierExtension(true)
 
 ### Step 2: Cache Responses After Settlement
 
-Store responses after successful payment settlement:
+Store the HTTP request fingerprint with the payment ID. Hashing the payment payload (or the raw payment header) is not request binding: the same signed payload can be replayed against a different method, path, or body.
 
 ```typescript
+import { createHash } from "crypto";
 import { extractPaymentIdentifier } from "@x402/extensions/payment-identifier";
 
-// In-memory cache (use Redis in production)
-const idempotencyCache = new Map<string, { timestamp: number; response: unknown }>();
+const idempotencyCache = new Map<string, { timestamp: number; fingerprint: string; response: unknown }>();
+const pendingFingerprints = new Map<string, string>();
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function requestFingerprint(req: { method: string; originalUrl: string }, body: Buffer, payload: { accepted?: Record<string, string> }): string {
+  const url = new URL(req.originalUrl, "http://localhost");
+  url.searchParams.sort();
+  const accepted = payload.accepted ?? {};
+  const material = {
+    method: req.method.toUpperCase(),
+    url: url.pathname + url.search,
+    bodySha256: createHash("sha256").update(body).digest("hex"),
+    scheme: accepted.scheme ?? "",
+    network: accepted.network ?? "",
+    asset: accepted.asset ?? "",
+    amount: accepted.amount ?? "",
+    payTo: accepted.payTo ?? "",
+  };
+  return createHash("sha256").update(JSON.stringify(material)).digest("hex");
+}
 
 const resourceServer = new x402ResourceServer(facilitatorClient)
   .register("eip155:84532", new ExactEvmScheme())
   .onAfterSettle(async ({ paymentPayload }) => {
     const paymentId = extractPaymentIdentifier(paymentPayload);
-    if (paymentId) {
+    const fingerprint = paymentId ? pendingFingerprints.get(paymentId) : undefined;
+    if (paymentId && fingerprint) {
+      pendingFingerprints.delete(paymentId);
       idempotencyCache.set(paymentId, {
         timestamp: Date.now(),
+        fingerprint,
         response: { /* your response data */ },
       });
     }
@@ -272,29 +293,36 @@ const resourceServer = new x402ResourceServer(facilitatorClient)
 
 ### Step 3: Check Cache Before Payment
 
-Use the `onProtectedRequest` hook to return cached responses and skip payment processing:
+`onProtectedRequest` can only return `{ grantAccess: true }` (runs the resource handler) or `{ abort: true }` (HTTP 403). It cannot return 409. Check the fingerprint in application middleware **before** payment middleware, and never call `grantAccess` on drift:
 
 ```typescript
-const httpServer = new x402HTTPResourceServer(resourceServer, routes)
-  .onProtectedRequest(async (context) => {
-    if (!context.paymentHeader) return;
+app.use((req, res, next) => {
+  if (!req.headers["x-payment"] && !req.headers["payment-signature"]) return next();
+  try {
+    const header = String(req.headers["payment-signature"] || req.headers["x-payment"]);
+    const paymentPayload = JSON.parse(Buffer.from(header, "base64").toString("utf-8"));
+    const paymentId = extractPaymentIdentifier(paymentPayload);
+    if (!paymentId) return next();
 
-    try {
-      const paymentPayload = JSON.parse(
-        Buffer.from(context.paymentHeader, "base64").toString("utf-8"),
-      );
-      const paymentId = extractPaymentIdentifier(paymentPayload);
-
-      if (paymentId) {
-        const cached = idempotencyCache.get(paymentId);
-        if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-          return { grantAccess: true }; // Skip payment, serve from cache
-        }
+    const fingerprint = requestFingerprint(req, Buffer.alloc(0), paymentPayload);
+    const cached = idempotencyCache.get(paymentId);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      if (cached.fingerprint !== fingerprint) {
+        return res.status(409).json({
+          error: "payment identifier already used with different request",
+          paymentId,
+        });
       }
-    } catch {
-      // Invalid payment header, continue to normal payment flow
+      return res.json(cached.response); // same request: skip payment, do not grantAccess
     }
-  });
+    pendingFingerprints.set(paymentId, fingerprint);
+  } catch {
+    // Invalid payment header, continue to normal payment flow
+  }
+  next();
+});
+
+app.use(paymentMiddlewareFromHTTPServer(httpServer));
 ```
 
 </Tab>
@@ -344,22 +372,24 @@ declare_payment_identifier_extension(required=True)
 
 ### Step 2: Cache Responses After Settlement
 
-Store responses after successful payment settlement:
+Store the HTTP request fingerprint with the payment ID. Do not key the cache on payment ID alone.
 
 ```python
 import time
 from x402.schemas import SettleContext
 from x402.extensions.payment_identifier import extract_payment_identifier
 
-# In-memory cache (use Redis in production)
 idempotency_cache: dict = {}
+pending_fingerprints: dict[str, str] = {}
 CACHE_TTL_SECONDS = 60 * 60  # 1 hour
 
 async def after_settle(ctx: SettleContext) -> None:
     payment_id = extract_payment_identifier(ctx.payment_payload)
-    if payment_id:
+    fingerprint = pending_fingerprints.pop(payment_id, None) if payment_id else None
+    if payment_id and fingerprint:
         idempotency_cache[payment_id] = {
             "timestamp": time.time(),
+            "fingerprint": fingerprint,
             "response": {},  # your response data
         }
 
@@ -370,7 +400,7 @@ server.on_after_settle(after_settle)
 
 ### Step 3: Check Cache Before Payment
 
-Use FastAPI middleware to check the cache before the payment middleware processes the request:
+Register payment middleware first, then the idempotency middleware, so the cache check is outermost. On fingerprint mismatch return `409` and do not call the resource handler:
 
 ```python
 import base64
@@ -378,9 +408,11 @@ import json
 from fastapi import Request, Response
 from x402.schemas import PaymentPayload
 
+app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
+
 @app.middleware("http")
 async def idempotency_middleware(request: Request, call_next):
-    payment_header = request.headers.get("X-Payment")
+    payment_header = request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("X-Payment")
     if payment_header:
         try:
             payment_data = json.loads(base64.b64decode(payment_header))
@@ -388,19 +420,32 @@ async def idempotency_middleware(request: Request, call_next):
             payment_id = extract_payment_identifier(payment_payload)
 
             if payment_id:
+                fingerprint = request_fingerprint(
+                    method=request.method,
+                    url=str(request.url),
+                    body=await request.body(),
+                    payload=payment_payload,
+                )
                 cached = idempotency_cache.get(payment_id)
                 if cached and time.time() - cached["timestamp"] < CACHE_TTL_SECONDS:
+                    if cached["fingerprint"] != fingerprint:
+                        return Response(
+                            content=json.dumps({
+                                "error": "payment identifier already used with different request",
+                                "paymentId": payment_id,
+                            }),
+                            media_type="application/json",
+                            status_code=409,
+                        )
                     return Response(
                         content=json.dumps(cached["response"]),
                         media_type="application/json",
                     )
+                pending_fingerprints[payment_id] = fingerprint
         except Exception:
             pass  # Invalid payment header, continue to normal flow
 
     return await call_next(request)
-
-# Add payment middleware AFTER idempotency middleware
-app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
 ```
 
 </Tab>
@@ -480,13 +525,16 @@ processedPayments[paymentID] = responseData
 
 ### Request Binding
 
-Servers should bind each payment ID to a normalized fingerprint of the request before returning a cached result. The fingerprint should cover the parts of the request that make the paid operation unique:
+Servers should bind each payment ID to a normalized fingerprint of the HTTP request before returning a cached result. Hashing the payment payload or `PAYMENT-SIGNATURE` / `X-Payment` header is not sufficient: those values do not change when the same signed payload is sent as a different method, path, query, or body.
+
+The fingerprint should cover the parts of the request that make the paid operation unique:
 
 - `scheme`, `network`, `asset`, `amount`, `payTo`
-- Resource path and HTTP method
+- HTTP method and canonical resource path (sorted query, no fragment)
+- Raw request body SHA-256
 - Application-level operation or order identifier (when available)
 
-Store the first observed fingerprint with the payment ID. Later requests with the same ID and the same fingerprint can return the cached response. Later requests with the same ID but a different fingerprint should return `409 Conflict` — not a cached response or a second execution.
+Store the first observed fingerprint with the payment ID. Later requests with the same ID and the same fingerprint can return the cached response. Later requests with the same ID but a different fingerprint should return `409 Conflict`, not a cached response, a second execution, or `grantAccess: true`.
 
 When the same backend handles multiple paid resources, scope the storage key by tenant, merchant, route, or facilitator account to avoid cross-resource collisions.
 
@@ -513,7 +561,7 @@ Adjust `CACHE_TTL_MS` (TypeScript/Go) or `CACHE_TTL_SECONDS` (Python) based on y
 
 1. **Use Redis or similar** instead of in-memory cache for distributed systems
 2. **Handle cache failures gracefully** - if cache is unavailable, process payment normally
-3. **Bind payment IDs to request fingerprints** - store the fingerprint (scheme, network, asset, amount, payTo, route, and application operation ID) alongside the payment ID and return `409 Conflict` if the same ID is replayed with a different fingerprint
+3. **Bind payment IDs to request fingerprints** - store the fingerprint (scheme, network, asset, amount, payTo, HTTP method, canonical path, raw body SHA-256, and application operation ID) alongside the payment ID and return `409 Conflict` if the same ID is replayed with a different fingerprint. Do not fingerprint only the payment payload.
 4. **Monitor cache hit rates** to tune TTL and detect abuse
 
 ## API Reference

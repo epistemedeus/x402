@@ -6,56 +6,19 @@ Express.js server demonstrating how to use the `payment-identifier` extension fo
 
 1. Server advertises `payment-identifier` extension support in the `PaymentRequired` response
 2. Client includes a unique payment ID in their `PaymentPayload`
-3. Server caches responses keyed by payment ID (1-hour TTL)
-4. If the same payment ID is seen again, the cached response is returned without re-processing payment
+3. Server caches responses keyed by payment ID plus an HTTP request fingerprint (1-hour TTL)
+4. Same payment ID and same fingerprint return the cached response without re-processing payment
+5. Same payment ID with a different method, path, query, or body returns HTTP 409 and does not grant access
 
 ```typescript
-import {
-  paymentMiddlewareFromHTTPServer,
-  x402ResourceServer,
-  x402HTTPResourceServer,
-} from "@x402/express";
-import {
-  declarePaymentIdentifierExtension,
-  extractPaymentIdentifier,
-  PAYMENT_IDENTIFIER,
-} from "@x402/extensions/payment-identifier";
+import { paymentMiddlewareFromHTTPServer } from "@x402/express";
 
-// In-memory cache (use Redis in production)
-const idempotencyCache = new Map<string, { timestamp: number; response: unknown }>();
-const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+// Bind each payment ID to an HTTP request fingerprint (see request-binding.ts).
+// Check the cache in Express middleware before payment middleware.
+// Same fingerprint: return the cached body. Different fingerprint: HTTP 409.
+// Do not return { grantAccess: true } on fingerprint mismatch.
 
-const routes = {
-  "GET /weather": {
-    accepts: { scheme: "exact", price: "$0.001", network: "eip155:84532", payTo: address },
-    extensions: {
-      [PAYMENT_IDENTIFIER]: declarePaymentIdentifierExtension(false), // optional
-    },
-  },
-};
-
-const resourceServer = new x402ResourceServer(facilitatorClient)
-  .register("eip155:84532", new ExactEvmScheme())
-  .onAfterSettle(async ({ paymentPayload }) => {
-    const paymentId = extractPaymentIdentifier(paymentPayload);
-    if (paymentId) {
-      idempotencyCache.set(paymentId, { timestamp: Date.now(), response: { ... } });
-    }
-  });
-
-const httpServer = new x402HTTPResourceServer(resourceServer, routes)
-  .onProtectedRequest(async (context) => {
-    // Check if payment ID is in cache
-    const paymentPayload = JSON.parse(Buffer.from(context.paymentHeader, "base64").toString());
-    const paymentId = extractPaymentIdentifier(paymentPayload);
-    if (paymentId) {
-      const cached = idempotencyCache.get(paymentId);
-      if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-        return { grantAccess: true }; // Skip payment, grant access
-      }
-    }
-  });
-
+app.use(idempotencyMiddleware); // 200 cache hit or 409 conflict, no grantAccess
 app.use(paymentMiddlewareFromHTTPServer(httpServer));
 ```
 
@@ -111,7 +74,8 @@ The client will:
 | Scenario | Server Response |
 |----------|-----------------|
 | New payment ID | Process payment normally, cache response |
-| Same payment ID (within TTL) | Return cached response, skip payment |
+| Same payment ID, same request fingerprint (within TTL) | Return cached response, skip payment |
+| Same payment ID, different request fingerprint | Return 409 Conflict, do not grant access |
 | Same payment ID (after TTL) | Process payment normally, update cache |
 | No payment ID | Process payment normally (no caching) |
 
@@ -133,9 +97,15 @@ Adjust `CACHE_TTL_MS` based on your use case:
 - Short TTL (5-15 min): For time-sensitive resources
 - Long TTL (1-24 hours): For static or infrequently changing resources
 
+Request-binding unit tests (no wallet, chain, facilitator, or payment):
+
+```bash
+pnpm test
+```
+
 ## Production Considerations
 
 1. **Use Redis or similar** instead of in-memory cache for distributed systems
 2. **Handle cache failures gracefully** - if cache is unavailable, process payment normally
-3. **Consider payload hashing** - for additional safety, hash the full payload and reject if same ID but different payload (409 Conflict)
+3. **Bind payment IDs to the HTTP request** - fingerprint method, canonical path+query, raw body, and accepted terms. Do not hash only the payment payload. Return 409 on drift without grantAccess.
 4. **Monitor cache hit rates** to tune TTL and detect abuse
