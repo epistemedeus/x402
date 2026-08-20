@@ -6,9 +6,11 @@ Example server demonstrating how to implement the `payment-identifier` extension
 
 1. Server advertises `payment-identifier` extension support in PaymentRequired responses
 2. Server extracts payment ID from incoming PaymentPayload using `extract_payment_identifier()`
-3. After settlement, server caches the response keyed by payment ID plus an HTTP request fingerprint (method, canonical path+query, raw body SHA-256, accepted terms)
-4. Same payment ID and same fingerprint return the cached response without payment processing
-5. Same payment ID with a different method, path, query, or body returns HTTP 409 and does not grant access
+3. Before payment middleware, the server looks up the settled cache, then holds an expiring in-flight reservation (fingerprint + timestamp, 30s TTL, distinct from the 1-hour cache)
+4. After settlement, `on_after_settle` consumes only that live reservation and caches its exact fingerprint
+5. Same payment ID and same fingerprint return the cached response without payment processing
+6. Same payment ID with a different method, path, query, or body returns HTTP 409 and does not grant access
+7. A second in-flight request never overwrites a live reservation; same fingerprint is an in-flight 409, a different fingerprint is the request-conflict 409
 
 ```python
 from x402.extensions.payment_identifier import (
@@ -30,10 +32,14 @@ routes = {
     ),
 }
 
-# Cache response after settlement, including the request fingerprint
+# Consume the live reservation after settlement; do not cache if missing or expired
 async def after_settle(ctx):
     payment_id = extract_payment_identifier(ctx.payment_payload)
-    fingerprint = pending_fingerprints.pop(payment_id, None) if payment_id else None
+    fingerprint = (
+        consume_reservation(pending_reservations, payment_id=payment_id, now=time.time(), ttl_seconds=30)
+        if payment_id
+        else None
+    )
     if payment_id and fingerprint:
         idempotency_cache[payment_id] = cached_response
 
@@ -78,6 +84,7 @@ Payment-Identifier Example Server
 
 Idempotency Configuration:
    - Cache TTL: 1 hour
+   - In-flight reservation TTL: 30 seconds
    - Payment ID: optional (required: false)
 
 How it works:
@@ -85,7 +92,8 @@ How it works:
    2. Server caches the response bound to that ID and the HTTP request
    3. Same ID and same request fingerprint returns the cached response
    4. Same ID with a different method, path, query, or body returns 409
-   5. No duplicate payment processing occurs on a cache hit
+   5. A live in-flight reservation is never overwritten
+   6. No duplicate payment processing occurs on a cache hit
 ```
 
 Request-binding unit tests (no wallet, chain, facilitator, or payment):
@@ -141,4 +149,5 @@ Clients must provide a payment ID. Requests without one will be rejected.
 1. **Use a distributed cache** (Redis, Memcached) instead of in-memory dict
 2. **Configure appropriate TTL** based on your use case
 3. **Bind payment IDs to the HTTP request** (method, canonical path+query, raw body, accepted terms) and return 409 on drift
-4. **Monitor cache hit rates** to optimize performance
+4. **Reserve in-flight payment IDs** with a short TTL (30s here) so concurrent requests cannot overwrite the first fingerprint; expire failed verification so the map cannot grow without bound
+5. **Monitor cache hit rates** to optimize performance

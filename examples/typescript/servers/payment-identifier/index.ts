@@ -12,7 +12,16 @@ import {
   extractPaymentIdentifier,
   PAYMENT_IDENTIFIER,
 } from "@x402/extensions/payment-identifier";
-import { CONFLICT_MESSAGE, lookup, requestFingerprint } from "./request-binding.js";
+import {
+  CONFLICT_MESSAGE,
+  IN_FLIGHT_MESSAGE,
+  RESERVATION_TTL_MS,
+  bindPaymentId,
+  cleanupExpiredReservations,
+  consumeReservation,
+  requestFingerprint,
+  type Reservation,
+} from "./request-binding.js";
 config();
 
 const address = process.env.ADDRESS as `0x${string}`;
@@ -35,11 +44,11 @@ interface CachedResponse {
 }
 
 const idempotencyCache = new Map<string, CachedResponse>();
-const pendingFingerprints = new Map<string, string>();
+const pendingReservations = new Map<string, Reservation>();
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 /**
- * Cleans up expired entries from the cache.
+ * Cleans up expired cache and in-flight reservation entries.
  */
 function cleanupExpiredEntries(): void {
   const now = Date.now();
@@ -48,10 +57,14 @@ function cleanupExpiredEntries(): void {
       idempotencyCache.delete(key);
     }
   }
+  cleanupExpiredReservations(pendingReservations, now, RESERVATION_TTL_MS);
 }
 
 /**
- * Raw request body bytes used in the HTTP fingerprint. GET requests hash empty.
+ * Raw request body bytes used in the HTTP fingerprint.
+ *
+ * This example is GET-only and does not install Express body-parsing middleware,
+ * so the fingerprint hashes empty bytes. It does not capture arbitrary POST bodies.
  *
  * @param req - Express request
  * @returns Raw body buffer
@@ -102,11 +115,15 @@ const resourceServer = new x402ResourceServer(facilitatorClient)
     if (!paymentId) {
       return;
     }
-    const fingerprint = pendingFingerprints.get(paymentId);
+    const fingerprint = consumeReservation(
+      pendingReservations,
+      paymentId,
+      Date.now(),
+      RESERVATION_TTL_MS,
+    );
     if (!fingerprint) {
       return;
     }
-    pendingFingerprints.delete(paymentId);
     console.log(`[Idempotency] Caching response for payment ID: ${paymentId}`);
     idempotencyCache.set(paymentId, {
       timestamp: Date.now(),
@@ -151,12 +168,29 @@ app.use((req, res, next) => {
       body: requestBodyBytes(req),
       payload: paymentPayload,
     });
-    const decision = lookup(idempotencyCache.get(paymentId), fingerprint, Date.now(), CACHE_TTL_MS);
+    const decision = bindPaymentId({
+      cache: idempotencyCache,
+      reservations: pendingReservations,
+      paymentId,
+      fingerprint,
+      now: Date.now(),
+      cacheTtlMs: CACHE_TTL_MS,
+      reservationTtlMs: RESERVATION_TTL_MS,
+    });
 
     if (decision.kind === "conflict") {
       console.log(`[Idempotency] CONFLICT - same ID, different request`);
       res.status(409).json({
         error: CONFLICT_MESSAGE,
+        paymentId,
+      });
+      return;
+    }
+
+    if (decision.kind === "in_flight") {
+      console.log(`[Idempotency] IN FLIGHT - same ID, request already reserved`);
+      res.status(409).json({
+        error: IN_FLIGHT_MESSAGE,
         paymentId,
       });
       return;
@@ -179,14 +213,7 @@ app.use((req, res, next) => {
       }
     }
 
-    if (decision.kind === "expired") {
-      console.log(`[Idempotency] Cache EXPIRED - proceeding with payment`);
-      idempotencyCache.delete(paymentId);
-    } else {
-      console.log(`[Idempotency] Cache MISS - proceeding with payment`);
-    }
-
-    pendingFingerprints.set(paymentId, fingerprint);
+    console.log(`[Idempotency] Cache MISS - reserved, proceeding with payment`);
   } catch {
     // Invalid payment header format, continue to normal flow
   }
@@ -211,11 +238,13 @@ app.listen(4022, () => {
   console.log(`   Listening at http://localhost:4022`);
   console.log(`\n📋 Idempotency Configuration:`);
   console.log(`   - Cache TTL: 1 hour`);
+  console.log(`   - In-flight reservation TTL: 30 seconds`);
   console.log(`   - Payment ID: optional (required: false)`);
   console.log(`\n💡 How it works:`);
   console.log(`   1. Client sends payment with a unique payment ID`);
   console.log(`   2. Server caches the response bound to that ID and the HTTP request`);
   console.log(`   3. Same ID and same request fingerprint returns the cached response`);
   console.log(`   4. Same ID with a different method, path, query, or body returns 409`);
-  console.log(`   5. No duplicate payment processing occurs on a cache hit\n`);
+  console.log(`   5. A live in-flight reservation is never overwritten`);
+  console.log(`   6. No duplicate payment processing occurs on a cache hit\n`);
 });
