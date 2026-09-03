@@ -138,10 +138,14 @@ export { checkIfBazaarNeeded, validateBazaarRouteExtensions } from "./startupVal
 // Export client extension (for facilitator clients querying discovery)
 export {
   withBazaar,
+  filterDiscoveryResources,
   type BazaarClientExtension,
   type ListDiscoveryResourcesParams,
   type SearchDiscoveryResourcesParams,
   type DiscoveryResource,
   type DiscoveryResourcesResponse,
   type SearchDiscoveryResourcesResponse,
+  type InspectedRouteBadge,
+  type InspectedRoute,
+  type InspectedRouteFeed,
 } from "./facilitatorClient";
