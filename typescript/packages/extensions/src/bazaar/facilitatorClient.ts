@@ -159,6 +159,99 @@ export interface SearchDiscoveryResourcesResponse {
 }
 
 /**
+ * Inspection badge on a published route list. Only `"verified"` rows are
+ * used as matches; `"drift"` and `"unverified"` never keep a Bazaar row.
+ */
+export type InspectedRouteBadge = "verified" | "drift" | "unverified";
+
+/**
+ * One row of a published inspected-route document (origin + path + badge).
+ * Extra fields on a real feed are ignored.
+ */
+export interface InspectedRoute {
+  origin: string;
+  route: string;
+  badge: InspectedRouteBadge;
+}
+
+/**
+ * Published inspected-route document. Callers fetch this JSON themselves
+ * and pass it in; this helper does not retrieve or rank anything.
+ */
+export interface InspectedRouteFeed {
+  routes: InspectedRoute[];
+}
+
+/**
+ * Origin + path identity for a resource URL. Host is case-insensitive;
+ * trailing slashes, query strings, and fragments are ignored.
+ *
+ * @param url - Absolute resource URL from a Bazaar row
+ * @returns Canonical origin+path, or undefined when `url` is not a valid URL
+ */
+function resourceIdentity(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace(/\/+$/, "") || "/";
+    return `${parsed.protocol}//${parsed.host.toLowerCase()}${path}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Origin + path identity for one inspected-route row.
+ *
+ * @param origin - Absolute origin (scheme + host)
+ * @param route - Path beginning with `/`
+ * @returns Canonical origin+path, or undefined when the pair is not a valid URL
+ */
+function inspectedIdentity(origin: string, route: string): string | undefined {
+  try {
+    const originUrl = origin.endsWith("/") ? origin : `${origin}/`;
+    return resourceIdentity(new URL(route, originUrl).href);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Keep Bazaar discovery rows whose resource URL matches a verified
+ * inspected route. Does not reorder remaining rows and does not change
+ * how the facilitator ranks search hits.
+ *
+ * @param items - Bazaar `listResources` items or `search` resources
+ * @param feed - Published inspected-route document (`origin`, `route`, `badge`)
+ * @returns Rows whose URL matches a `badge: "verified"` route, in original order
+ *
+ * @example
+ * ```ts
+ * const listed = await client.extensions.bazaar.listResources({ type: "http" });
+ * const kept = filterDiscoveryResources(listed.items, inspectedFeed);
+ * ```
+ */
+export function filterDiscoveryResources(
+  items: readonly DiscoveryResource[],
+  feed: InspectedRouteFeed,
+): DiscoveryResource[] {
+  if (!Array.isArray(feed?.routes)) {
+    throw new Error("inspected route feed must include a routes array");
+  }
+
+  const allowed = new Set<string>();
+  for (const row of feed.routes) {
+    if (row.badge !== "verified") continue;
+    const id = inspectedIdentity(row.origin, row.route);
+    if (id) allowed.add(id);
+  }
+
+  return items.filter(item => {
+    const id = resourceIdentity(item.resource);
+    return id !== undefined && allowed.has(id);
+  });
+}
+
+/**
  * Bazaar client extension interface providing discovery query functionality.
  */
 export interface BazaarClientExtension {
@@ -199,6 +292,9 @@ export interface BazaarClientExtension {
  *
  * // Search
  * const results = await client.extensions.bazaar.search({ query: "weather APIs" });
+ *
+ * // Keep rows that match a verified inspected-route document
+ * const kept = filterDiscoveryResources(results.resources, inspectedFeed);
  *
  * // Chaining with other extensions
  * const client = withBazaar(withOtherExtension(new HTTPFacilitatorClient()));

@@ -6,6 +6,41 @@ import type { AddressInfo } from "node:net";
 import { x402ResourceServer } from "@x402/core/server";
 import { paymentMiddleware } from "./index";
 
+/** Network the routing tests price their protected routes on. */
+const TEST_NETWORK = "eip155:84532";
+
+/**
+ * Builds an initialized resource server with the `exact` scheme registered and
+ * a stub facilitator advertising it, so a matched route answers 402 instead of
+ * failing to build payment requirements.
+ *
+ * @returns A resource server that serves a real 402 for a matched route.
+ */
+async function buildTestResourceServer(): Promise<x402ResourceServer> {
+  const resourceServer = new x402ResourceServer({
+    getSupported: async () => ({
+      kinds: [{ x402Version: 2, scheme: "exact", network: TEST_NETWORK }],
+      extensions: [],
+      signers: {},
+    }),
+    verify: async () => ({ isValid: true }),
+    settle: async () => ({ success: true, transaction: "", network: TEST_NETWORK }),
+  });
+  resourceServer.register(TEST_NETWORK, {
+    scheme: "exact",
+    parsePrice: async () => ({
+      amount: "1000000",
+      asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      extra: {},
+    }),
+    enhancePaymentRequirements: async paymentRequirements => paymentRequirements,
+    defaultAssetTransferMethod: "default",
+    paymentFlows: { default: { supported: ["upfront"], default: "upfront" } },
+  });
+  await resourceServer.initialize();
+  return resourceServer;
+}
+
 /**
  * Issue a single HTTP GET to the given port + raw path and return the
  * response status. The path is sent verbatim — Node does not re-encode
@@ -32,7 +67,7 @@ describe("express end-to-end: encoded path separator", () => {
 
   beforeAll(async () => {
     const app = express();
-    const resourceServer = new x402ResourceServer();
+    const resourceServer = await buildTestResourceServer();
     app.use(
       paymentMiddleware(
         {
@@ -41,7 +76,7 @@ describe("express end-to-end: encoded path separator", () => {
               scheme: "exact",
               payTo: "0xabc",
               price: "$1.00",
-              network: "eip155:84532",
+              network: TEST_NETWORK,
             },
           },
         },
@@ -79,6 +114,65 @@ describe("express end-to-end: encoded path separator", () => {
 
   it("returns 402 even when the :id segment contains %5C (encoded backslash)", async () => {
     expect(await statusFor(port, "/api/report/a%5Cb")).toBe(402);
+  });
+
+  // path-to-regexp still dispatches /api/report/a\b to the :id handler, so
+  // folding that "\" into a "/" in the middleware would fail open.
+  it("returns 402 even when the :id segment contains a raw backslash", async () => {
+    expect(await statusFor(port, "/api/report/a\\b")).toBe(402);
+  });
+
+  it("returns 200 (middleware skipped) for an unrelated path", async () => {
+    expect(await statusFor(port, "/health")).toBe(200);
+  });
+});
+
+describe("express end-to-end: trailing wildcard route prefix", () => {
+  let server: Server;
+  let port: number;
+
+  beforeAll(async () => {
+    const app = express();
+    const resourceServer = await buildTestResourceServer();
+    app.use(
+      paymentMiddleware(
+        {
+          "/api/premium/*": {
+            accepts: {
+              scheme: "exact",
+              payTo: "0xabc",
+              price: "$1.00",
+              network: "eip155:84532",
+            },
+          },
+        },
+        resourceServer,
+        undefined,
+        undefined,
+        false,
+      ),
+    );
+    app.use((_req, res) => res.status(200).send("ok"));
+
+    server = app.listen(0);
+    await new Promise<void>(resolve => server.once("listening", () => resolve()));
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+
+  it("returns 402 for a baseline wildcard sub-path", async () => {
+    expect(await statusFor(port, "/api/premium/report")).toBe(402);
+  });
+
+  it("returns 402 for the bare wildcard prefix with a trailing slash", async () => {
+    expect(await statusFor(port, "/api/premium/")).toBe(402);
+  });
+
+  it("returns 402 for the bare wildcard prefix without a trailing slash", async () => {
+    expect(await statusFor(port, "/api/premium")).toBe(402);
   });
 
   it("returns 200 (middleware skipped) for an unrelated path", async () => {

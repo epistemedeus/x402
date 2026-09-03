@@ -7,8 +7,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   withBazaar,
+  filterDiscoveryResources,
   type DiscoveryResource,
   type DiscoveryResourcesResponse,
+  type InspectedRouteFeed,
   type ListDiscoveryResourcesParams,
   type SearchDiscoveryResourcesParams,
   type SearchDiscoveryResourcesResponse,
@@ -470,6 +472,94 @@ describe("Bazaar Client Extension - facilitatorClient", () => {
         expect(result.pagination?.limit).toBe(10);
         expect(result.pagination?.cursor).toBe("nextPageToken");
       });
+    });
+  });
+
+  describe("filterDiscoveryResources", () => {
+    const row = (resource: string): DiscoveryResource => ({
+      resource,
+      type: "http",
+      x402Version: 2,
+      accepts: [],
+      lastUpdated: "2024-01-01T00:00:00.000Z",
+    });
+
+    const feed: InspectedRouteFeed = {
+      routes: [
+        {
+          origin: "https://agents.samedaydesk.com",
+          route: "/extract",
+          badge: "verified",
+        },
+        {
+          origin: "https://agents.samedaydesk.com",
+          route: "/read",
+          badge: "verified",
+        },
+        {
+          origin: "https://agents.samedaydesk.com",
+          route: "/scan",
+          badge: "drift",
+        },
+        {
+          origin: "https://other.example",
+          route: "/paid",
+          badge: "unverified",
+        },
+      ],
+    };
+
+    it("keeps verified origin+route matches and drops everything else", () => {
+      const items = [
+        row("https://agents.samedaydesk.com/extract"),
+        row("https://agents.samedaydesk.com/scan"),
+        row("https://other.example/paid"),
+        row("https://unlisted.example/v1"),
+      ];
+
+      const kept = filterDiscoveryResources(items, feed);
+      expect(kept.map(item => item.resource)).toEqual(["https://agents.samedaydesk.com/extract"]);
+    });
+
+    it("preserves original order of remaining rows", () => {
+      const items = [
+        row("https://agents.samedaydesk.com/read"),
+        row("https://unlisted.example/v1"),
+        row("https://agents.samedaydesk.com/extract"),
+      ];
+
+      const kept = filterDiscoveryResources(items, feed);
+      expect(kept.map(item => item.resource)).toEqual([
+        "https://agents.samedaydesk.com/read",
+        "https://agents.samedaydesk.com/extract",
+      ]);
+    });
+
+    it("matches host case-insensitively and ignores trailing slash and query", () => {
+      const items = [
+        row("https://Agents.SameDayDesk.com/extract/"),
+        row("https://agents.samedaydesk.com/read?format=json"),
+      ];
+
+      const kept = filterDiscoveryResources(items, feed);
+      expect(kept).toHaveLength(2);
+    });
+
+    it("returns no rows when the feed has no verified matches", () => {
+      const empty: InspectedRouteFeed = {
+        routes: [
+          { origin: "https://agents.samedaydesk.com", route: "/extract", badge: "unverified" },
+        ],
+      };
+      expect(
+        filterDiscoveryResources([row("https://agents.samedaydesk.com/extract")], empty),
+      ).toEqual([]);
+    });
+
+    it("throws when the feed has no routes array", () => {
+      expect(() => filterDiscoveryResources([], {} as InspectedRouteFeed)).toThrow(
+        "inspected route feed must include a routes array",
+      );
     });
   });
 });

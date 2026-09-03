@@ -222,7 +222,7 @@ import { HTTPFacilitatorClient } from "@x402/core/http";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { declareDiscoveryExtension } from "@x402/extensions/bazaar";
 
-const facilitatorClient = new HTTPFacilitatorClient({ url: "https://facilitator.x402.org" });
+const facilitatorClient = new HTTPFacilitatorClient({ url: "https://x402.org/facilitator" });
 const resourceServer = new x402ResourceServer(facilitatorClient)
   .register("eip155:84532", new ExactEvmScheme());
 
@@ -331,6 +331,25 @@ const resourceServer = new x402ResourceServer(facilitatorClient)
   .registerExtension(bazaarResourceServerExtension);
 ```
 
+## For Buyers
+
+`withBazaar` lists or searches facilitator catalogs. The same client-side
+filter already used for price or network can also keep only rows whose
+resource URL appears as a **verified** inspected route (`origin` + `route`).
+That is a local filter, not a ranking change.
+
+```typescript
+import { HTTPFacilitatorClient } from "@x402/core/http";
+import { withBazaar, filterDiscoveryResources } from "@x402/extensions/bazaar";
+
+const client = withBazaar(new HTTPFacilitatorClient());
+const listed = await client.extensions.bazaar.listResources({ type: "http" });
+const kept = filterDiscoveryResources(listed.items, inspectedFeed);
+```
+
+`inspectedFeed.routes` is the published JSON document shape: each row has
+`origin`, `route`, and `badge`. Only `badge: "verified"` matches.
+
 ## Bazaar API Reference
 
 ### `declareDiscoveryExtension(config)`
@@ -429,6 +448,10 @@ Validates a discovery extension's info against its schema.
 Validates and extracts discovery info in one step.
 
 **Returns:** `{ valid: boolean, info?: DiscoveryInfo, errors?: string[] }`
+
+### `filterDiscoveryResources(items, feed)`
+
+Keep Bazaar `listResources` / `search` rows whose `resource` URL matches a verified inspected route (`origin` + `route`). `drift` and `unverified` rows never match. Remaining items keep their original order.
 
 ### `bazaarResourceServerExtension`
 
