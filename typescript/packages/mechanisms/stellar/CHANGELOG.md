@@ -1,5 +1,11 @@
 # @x402/stellar Changelog
 
+## Unreleased
+
+### Patch Changes
+
+- Stellar exact verify accepts one OpenZeppelin `spending_limit_enforced` event from a non-asset contract beside the single SEP-41 transfer when the smart account, i128 amount, and transfer context match. The same symbol from the asset contract, other policy events, and `transfer`, `mint`, `burn`, and `clawback` from any contract stay rejected. The default `maxTransactionFeeStroops` ceiling remains 50,000 stroops.
+
 ## 2.28.0
 
 ### Minor Changes
