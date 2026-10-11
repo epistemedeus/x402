@@ -1,0 +1,301 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { x402Client } from "@x402/core/client";
+import type { Network, PaymentRequired } from "@x402/core/types";
+import type { SchemeNetworkClient } from "@x402/core/types";
+import { x402MCPClient } from "../../src";
+
+const network = "eip155:84532" as Network;
+
+const paymentRequired: PaymentRequired = {
+  x402Version: 2,
+  accepts: [
+    {
+      scheme: "test-scheme",
+      network,
+      amount: "1000",
+      asset: "0xtoken",
+      payTo: "0xrecipient",
+      maxTimeoutSeconds: 60,
+      extra: {},
+    },
+  ],
+  resource: { url: "mcp://tool/test", description: "Test tool", mimeType: "application/json" },
+};
+
+function embedded(value: PaymentRequired) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value) }],
+    isError: true as const,
+  };
+}
+
+function success(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: false as const };
+}
+
+describe("x402MCPClient per-call context", () => {
+  let mcp: { callTool: ReturnType<typeof vi.fn> };
+  let seen: Array<{ name?: string; article?: unknown; amount: string }>;
+  let client: x402MCPClient;
+
+  beforeEach(() => {
+    seen = [];
+    mcp = { callTool: vi.fn() };
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload(_version, requirements, context) {
+        const toolCall = context?.call?.transport === "mcp" ? context.call.toolCall : undefined;
+        seen.push({
+          name: toolCall?.name,
+          article: toolCall?.arguments?.article,
+          amount: requirements.amount,
+        });
+        expect(requirements.payTo).toBe("0xrecipient");
+        expect(toolCall?.meta).toBeUndefined();
+        expect(JSON.stringify(toolCall ?? {})).not.toContain("scheme_signature");
+        return { x402Version: 2, payload: { signature: "scheme_signature" } };
+      },
+    };
+    const payment = new x402Client().register(network, scheme).setSpendControls(false);
+    client = new x402MCPClient(mcp as never, payment);
+  });
+
+  it("binds each concurrent tool call without reading a shared slot", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let waiting = 0;
+    mcp.callTool.mockImplementation(async (params: { _meta?: unknown }) => {
+      if (!params._meta) return embedded(paymentRequired);
+      waiting += 1;
+      await gate;
+      return success("ok");
+    });
+    const firstArgs = { article: "one" };
+    const secondArgs = { article: "two" };
+    const first = client.callTool("alpha", firstArgs);
+    const second = client.callTool("beta", secondArgs);
+    const started = Date.now();
+    while (seen.length < 2) {
+      if (Date.now() - started > 1000) throw new Error("timed out waiting for payment context");
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    firstArgs.article = "mutated";
+    expect(seen.map(item => item.article).sort()).toEqual(["one", "two"]);
+    release();
+    await Promise.all([first, second]);
+    const paid = mcp.callTool.mock.calls.filter(call => call[0]._meta);
+    expect(paid).toHaveLength(2);
+    expect(JSON.stringify(paid[0][0]._meta)).toContain("scheme_signature");
+    expect(JSON.stringify(seen)).not.toContain("scheme_signature");
+  });
+
+  it("reuses the original tool call when recovery signs a new amount", async () => {
+    const corrective: PaymentRequired = {
+      ...paymentRequired,
+      accepts: [{ ...paymentRequired.accepts[0], amount: "2000" }],
+    };
+    mcp.callTool
+      .mockResolvedValueOnce(embedded(paymentRequired))
+      .mockResolvedValueOnce(embedded(corrective))
+      .mockResolvedValueOnce(success("recovered"));
+    let recovered = false;
+    client.paymentClient.onPaymentResponse(async () => {
+      if (recovered) return;
+      recovered = true;
+      return { recovered: true };
+    });
+    const args = { article: "stable" };
+    const result = await client.callTool("paid_tool", args);
+    args.article = "later";
+    expect(result.paymentMade).toBe(true);
+    expect(seen).toEqual([
+      { name: "paid_tool", article: "stable", amount: "1000" },
+      { name: "paid_tool", article: "stable", amount: "2000" },
+    ]);
+  });
+
+  it("fail-closes uncloneable arguments before any tool call", async () => {
+    await expect(client.callTool("paid_tool", { fn: () => undefined })).rejects.toThrow(
+      "invalid_mcp_call_context",
+    );
+    await expect(client.callTool("", { article: "one" })).rejects.toThrow(
+      "invalid_mcp_call_context",
+    );
+    expect(mcp.callTool).not.toHaveBeenCalled();
+    expect(seen).toEqual([]);
+  });
+
+  it("lets a legacy scheme ignore call context", async () => {
+    const legacy: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload() {
+        return { x402Version: 2, payload: { signature: "legacy_signature" } };
+      },
+    };
+    const payment = new x402Client().register(network, legacy).setSpendControls(false);
+    const legacyClient = new x402MCPClient(mcp as never, payment);
+    mcp.callTool
+      .mockResolvedValueOnce(embedded(paymentRequired))
+      .mockResolvedValueOnce(success("legacy"));
+    const result = await legacyClient.callTool("paid_tool", { article: "one" });
+    expect(result.paymentMade).toBe(true);
+    expect(result.content[0]?.text).toBe("legacy");
+  });
+
+  it("transmits the committed tool call on unpaid, paid, and recovery RPCs", async () => {
+    const corrective: PaymentRequired = {
+      ...paymentRequired,
+      accepts: [{ ...paymentRequired.accepts[0], amount: "2000" }],
+    };
+    const rpc: Array<{ phase: string; name: string; article?: unknown }> = [];
+    let releaseUnpaid: () => void = () => {};
+    const unpaidGate = new Promise<void>(resolve => {
+      releaseUnpaid = resolve;
+    });
+    let unpaidWaiting = 0;
+    let paidCount = 0;
+    mcp.callTool.mockImplementation(
+      async (params: { name: string; arguments?: { article?: unknown }; _meta?: unknown }) => {
+        if (!params._meta) {
+          unpaidWaiting += 1;
+          await unpaidGate;
+          rpc.push({
+            phase: "unpaid",
+            name: params.name,
+            article: params.arguments?.article,
+          });
+          return embedded(paymentRequired);
+        }
+        paidCount += 1;
+        rpc.push({
+          phase: paidCount === 1 ? "paid" : "recovery",
+          name: params.name,
+          article: params.arguments?.article,
+        });
+        if (paidCount === 1) return embedded(corrective);
+        return success("ok");
+      },
+    );
+    client.onBeforePayment(context => {
+      context.arguments.article = "hook-mutated";
+    });
+    let recovered = false;
+    client.paymentClient.onPaymentResponse(async () => {
+      if (recovered) return;
+      recovered = true;
+      return { recovered: true };
+    });
+
+    const args = { article: "committed" };
+    const pending = client.callTool("paid_tool", args);
+    const started = Date.now();
+    while (unpaidWaiting < 1) {
+      if (Date.now() - started > 1000) throw new Error("timed out waiting for the unpaid RPC");
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    args.article = "caller-mutated";
+    releaseUnpaid();
+    const result = await pending;
+
+    expect(result.paymentMade).toBe(true);
+    expect(seen.map(item => item.article)).toEqual(["committed", "committed"]);
+    expect(rpc).toEqual([
+      { phase: "unpaid", name: "paid_tool", article: "committed" },
+      { phase: "paid", name: "paid_tool", article: "committed" },
+      { phase: "recovery", name: "paid_tool", article: "committed" },
+    ]);
+    expect(args.article).toBe("hook-mutated");
+  });
+
+  it("keeps concurrent transmissions on the arguments each scheme committed", async () => {
+    const rpc: Array<{ name: string; article?: unknown; paid: boolean }> = [];
+    let releaseUnpaid: () => void = () => {};
+    const unpaidGate = new Promise<void>(resolve => {
+      releaseUnpaid = resolve;
+    });
+    let unpaidWaiting = 0;
+    mcp.callTool.mockImplementation(
+      async (params: { name: string; arguments?: { article?: unknown }; _meta?: unknown }) => {
+        if (!params._meta) {
+          unpaidWaiting += 1;
+          await unpaidGate;
+          rpc.push({ name: params.name, article: params.arguments?.article, paid: false });
+          return embedded(paymentRequired);
+        }
+        rpc.push({ name: params.name, article: params.arguments?.article, paid: true });
+        return success("ok");
+      },
+    );
+    const firstArgs = { article: "one" };
+    const secondArgs = { article: "two" };
+    const first = client.callTool("alpha", firstArgs);
+    const second = client.callTool("beta", secondArgs);
+    const started = Date.now();
+    while (unpaidWaiting < 2) {
+      if (Date.now() - started > 1000)
+        throw new Error("timed out waiting for concurrent unpaid RPCs");
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    firstArgs.article = "mutated-one";
+    secondArgs.article = "mutated-two";
+    releaseUnpaid();
+    await Promise.all([first, second]);
+
+    expect(seen.map(item => item.article).sort()).toEqual(["one", "two"]);
+    expect(rpc.filter(item => !item.paid).sort((a, b) => a.name.localeCompare(b.name))).toEqual([
+      { name: "alpha", article: "one", paid: false },
+      { name: "beta", article: "two", paid: false },
+    ]);
+    expect(rpc.filter(item => item.paid).sort((a, b) => a.name.localeCompare(b.name))).toEqual([
+      { name: "alpha", article: "one", paid: true },
+      { name: "beta", article: "two", paid: true },
+    ]);
+  });
+
+  it("keeps transmitted arguments stable when a legacy scheme ignores context", async () => {
+    const legacy: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload() {
+        return { x402Version: 2, payload: { signature: "legacy_signature" } };
+      },
+    };
+    const payment = new x402Client().register(network, legacy).setSpendControls(false);
+    const legacyClient = new x402MCPClient(mcp as never, payment);
+    const rpc: Array<{ article?: unknown; paid: boolean }> = [];
+    let releaseUnpaid: () => void = () => {};
+    const unpaidGate = new Promise<void>(resolve => {
+      releaseUnpaid = resolve;
+    });
+    let unpaidWaiting = 0;
+    mcp.callTool.mockImplementation(
+      async (params: { arguments?: { article?: unknown }; _meta?: unknown }) => {
+        if (!params._meta) {
+          unpaidWaiting += 1;
+          await unpaidGate;
+          rpc.push({ article: params.arguments?.article, paid: false });
+          return embedded(paymentRequired);
+        }
+        rpc.push({ article: params.arguments?.article, paid: true });
+        return success("legacy");
+      },
+    );
+    const args = { article: "legacy-committed" };
+    const pending = legacyClient.callTool("paid_tool", args);
+    const started = Date.now();
+    while (unpaidWaiting < 1) {
+      if (Date.now() - started > 1000)
+        throw new Error("timed out waiting for the legacy unpaid RPC");
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    args.article = "legacy-mutated";
+    releaseUnpaid();
+    const result = await pending;
+    expect(result.paymentMade).toBe(true);
+    expect(rpc).toEqual([
+      { article: "legacy-committed", paid: false },
+      { article: "legacy-committed", paid: true },
+    ]);
+  });
+});

@@ -1,0 +1,542 @@
+import { describe, expect, it } from "vitest";
+import { x402Client, x402HTTPClient } from "../../../src/client";
+import {
+  MockSchemeNetworkClient,
+  buildPaymentRequired,
+  buildPaymentRequirements,
+} from "../../mocks";
+import type { Network, PaymentPayloadContext, PaymentRequired } from "../../../src/types";
+import type { SchemeNetworkClient } from "../../../src/types/mechanisms";
+
+const network = "test:network" as Network;
+
+function required(amount = "1000000"): PaymentRequired {
+  return buildPaymentRequired({
+    accepts: [
+      buildPaymentRequirements({
+        scheme: "test-scheme",
+        network,
+        amount,
+        payTo: "test_recipient",
+      }),
+    ],
+  });
+}
+
+function httpCall(url: string, headers: Record<string, string> = { "x-request-id": "req" }) {
+  return {
+    call: {
+      transport: "http" as const,
+      request: {
+        method: "POST",
+        url,
+        headers,
+      },
+    },
+  };
+}
+
+function payload() {
+  return { x402Version: 2, payload: { signature: "scheme_signature" } };
+}
+
+describe("request call context", () => {
+  it("fail-closes when a shared request slot changes during concurrent calls", async () => {
+    let slot = "";
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload() {
+        const seen = slot;
+        await new Promise(resolve => setTimeout(resolve, 15));
+        if (slot !== seen) {
+          throw new Error("fail_closed_request_mismatch");
+        }
+        return payload();
+      },
+    };
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+
+    slot = "https://pay.example/a";
+    const first = client.createPaymentPayload(required());
+    slot = "https://pay.example/b";
+    const second = client.createPaymentPayload(required());
+
+    await expect(first).rejects.toThrow("fail_closed_request_mismatch");
+    await expect(second).resolves.toMatchObject(payload());
+  });
+
+  it("drops a concurrent call when the scheme reads one shared request after yielding", async () => {
+    let slot = "";
+    const bound: string[] = [];
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload() {
+        await new Promise(resolve => setTimeout(resolve, 15));
+        bound.push(slot);
+        return payload();
+      },
+    };
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+
+    slot = "https://pay.example/a";
+    const first = client.createPaymentPayload(required());
+    slot = "https://pay.example/b";
+    const second = client.createPaymentPayload(required());
+    await Promise.all([first, second]);
+
+    expect(bound).toEqual(["https://pay.example/b", "https://pay.example/b"]);
+  });
+
+  it("keeps concurrent per-call HTTP context on the matching call", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let waiting = 0;
+    const seen: string[] = [];
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload(_version, requirements, context) {
+        if (context?.call?.transport !== "http") {
+          throw new Error("request_context_missing");
+        }
+        const url = context.call.request.url;
+        expect(requirements.payTo).toBe("test_recipient");
+        expect(requirements.amount).toBe("1000000");
+        expect(requirements.network).toBe(network);
+        waiting += 1;
+        await gate;
+        seen.push(url);
+        return payload();
+      },
+    };
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+    const first = client.createPaymentPayload(required(), httpCall("https://pay.example/a"));
+    const second = client.createPaymentPayload(required(), httpCall("https://pay.example/b"));
+    const settled = Promise.allSettled([first, second]);
+    const held = await Promise.race([
+      settled.then(() => "settled" as const),
+      viWait(() => waiting === 2).then(() => "held" as const),
+    ]);
+    if (held === "settled") {
+      const results = await settled;
+      const detail = results
+        .map(result => (result.status === "rejected" ? String(result.reason) : "fulfilled"))
+        .join(" | ");
+      throw new Error(detail);
+    }
+    release();
+    const results = await Promise.all([first, second]);
+
+    expect(seen.sort()).toEqual(["https://pay.example/a", "https://pay.example/b"]);
+    for (const result of results) {
+      expect(result.accepted.payTo).toBe("test_recipient");
+      expect(result.accepted.amount).toBe("1000000");
+      expect(JSON.stringify(result)).not.toContain("pay.example");
+      expect(JSON.stringify(result)).not.toContain("x-request-id");
+    }
+  });
+
+  it("leaves legacy callers valid and ignores context a scheme does not read", async () => {
+    const seen: Array<PaymentPayloadContext | undefined> = [];
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload(_version, _requirements, context) {
+        seen.push(context);
+        return payload();
+      },
+    };
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+
+    const withoutContext = await client.createPaymentPayload(required());
+    const withContext = await client.createPaymentPayload(
+      required(),
+      httpCall("https://pay.example/legacy"),
+    );
+
+    expect(seen[0]?.call).toBeUndefined();
+    expect(seen[1]?.call?.transport).toBe("http");
+    expect(withoutContext.accepted.payTo).toBe("test_recipient");
+    expect(withContext.accepted.payTo).toBe("test_recipient");
+    expect(withContext.payload).toEqual({ signature: "scheme_signature" });
+  });
+
+  it("shows hooks the call without letting it choose the payee, amount, or network", async () => {
+    let hookUrl = "";
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload(_version, requirements, context) {
+        expect(requirements.payTo).toBe("test_recipient");
+        expect(requirements.amount).toBe("1000000");
+        expect(requirements.network).toBe(network);
+        expect(context?.call?.transport).toBe("http");
+        if (context?.call?.transport === "http") {
+          expect(context.call.request.url).toBe(hookUrl);
+        }
+        return payload();
+      },
+    };
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+    client.onBeforePaymentCreation(async context => {
+      expect(context.selectedRequirements.payTo).toBe("test_recipient");
+      if (context.call?.transport !== "http") {
+        throw new Error("request_context_missing");
+      }
+      hookUrl = context.call.request.url;
+      expect(context.call.request.headers["x-pay-to"]).toBe("attacker");
+    });
+    client.onAfterPaymentCreation(async context => {
+      expect(context.call?.transport).toBe("http");
+      expect(context.paymentPayload.accepted.payTo).toBe("test_recipient");
+      expect(JSON.stringify(context.paymentPayload)).not.toContain("attacker");
+    });
+
+    const result = await client.createPaymentPayload(
+      required(),
+      httpCall("https://pay.example/hook", { "x-pay-to": "attacker", "x-amount": "999" }),
+    );
+
+    expect(hookUrl).toBe("https://pay.example/hook");
+    expect(result.accepted.amount).toBe("1000000");
+    expect(result.accepted.network).toBe(network);
+  });
+
+  it("still aborts from a hook and still enforces the spend cap", async () => {
+    const scheme = new MockSchemeNetworkClient("test-scheme");
+    const aborting = new x402Client().register(network, scheme).setSpendControls(false);
+    aborting.onBeforePaymentCreation(async context => {
+      expect(context.call?.transport).toBe("http");
+      return { abort: true, reason: "url_policy" };
+    });
+    await expect(
+      aborting.createPaymentPayload(required(), httpCall("https://pay.example/no")),
+    ).rejects.toThrow("Payment creation aborted: url_policy");
+    expect(scheme.createPaymentPayloadCalls).toHaveLength(0);
+
+    const capped = new x402Client().register(network, scheme);
+    await expect(
+      capped.createPaymentPayload(required("2000000"), httpCall("https://pay.example/cap")),
+    ).rejects.toThrow(/maxAmountPerPayment/);
+    expect(scheme.createPaymentPayloadCalls).toHaveLength(0);
+  });
+
+  it("passes the spend cap and extensions beside the call", async () => {
+    const scheme = new MockSchemeNetworkClient("test-scheme");
+    const client = new x402Client().register(network, scheme);
+    await client.createPaymentPayload(
+      buildPaymentRequired({
+        extensions: { "cardano-request-commitment": { info: { profile: "http:1" } } },
+        accepts: [buildPaymentRequirements({ scheme: "test-scheme", network, amount: "1000000" })],
+      }),
+      httpCall("https://pay.example/cap"),
+    );
+    const context = scheme.createPaymentPayloadCalls[0].context;
+    expect(context?.maxAmountPerPayment).toBe("1000000");
+    expect(context?.extensions).toEqual({
+      "cardano-request-commitment": { info: { profile: "http:1" } },
+    });
+    expect(context?.call?.transport).toBe("http");
+  });
+
+  it("does not read the body unless the scheme asks, and does not copy bytes into the payload", async () => {
+    let reads = 0;
+    const getBody = async () => {
+      reads += 1;
+      return new Uint8Array([9, 8, 7]);
+    };
+    const quiet: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload() {
+        return payload();
+      },
+    };
+    const quietClient = new x402Client().register(network, quiet).setSpendControls(false);
+    await quietClient.createPaymentPayload(required(), {
+      call: {
+        transport: "http",
+        request: {
+          method: "POST",
+          url: "https://pay.example/body",
+          headers: {},
+          getBody,
+        },
+      },
+    });
+    expect(reads).toBe(0);
+
+    const reading: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload(_version, _requirements, context) {
+        if (context?.call?.transport !== "http" || !context.call.request.getBody) {
+          throw new Error("request_context_missing");
+        }
+        const bytes = await context.call.request.getBody();
+        expect(bytes).toEqual(new Uint8Array([9, 8, 7]));
+        return payload();
+      },
+    };
+    const readingClient = new x402Client().register(network, reading).setSpendControls(false);
+    const result = await readingClient.createPaymentPayload(required(), {
+      call: {
+        transport: "http",
+        request: {
+          method: "POST",
+          url: "https://pay.example/body",
+          headers: { "x-request-id": "body" },
+          getBody,
+        },
+      },
+    });
+    expect(reads).toBe(1);
+    expect(JSON.stringify(result)).not.toContain("9,8,7");
+    await readingClient.createPaymentPayload(required(), {
+      call: {
+        transport: "http",
+        request: {
+          method: "POST",
+          url: "https://pay.example/body",
+          headers: {},
+          getBody,
+        },
+      },
+    });
+    expect(reads).toBe(2);
+  });
+
+  it("copies MCP tool arguments per call and keeps them off the payment payload", async () => {
+    const seen: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let waiting = 0;
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload(_version, requirements, context) {
+        if (context?.call?.transport !== "mcp") {
+          throw new Error("unsupported_call_transport");
+        }
+        const article = context.call.toolCall.arguments?.article;
+        expect(requirements.payTo).toBe("test_recipient");
+        waiting += 1;
+        await gate;
+        seen.push(String(article));
+        return payload();
+      },
+    };
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+    const firstArgs = { article: "one" };
+    const secondArgs = { article: "two" };
+    const first = client.createPaymentPayload(required(), {
+      call: { transport: "mcp", toolCall: { name: "paid_tool", arguments: firstArgs } },
+    });
+    const second = client.createPaymentPayload(required(), {
+      call: {
+        transport: "mcp",
+        toolCall: { name: "other_tool", arguments: secondArgs, meta: { trace: "t" } },
+      },
+    });
+    const settled = Promise.allSettled([first, second]);
+    const held = await Promise.race([
+      settled.then(() => "settled" as const),
+      viWait(() => waiting === 2).then(() => "held" as const),
+    ]);
+    expect(held).toBe("held");
+    firstArgs.article = "mutated";
+    release();
+    const results = await Promise.all([first, second]);
+    expect(seen.sort()).toEqual(["one", "two"]);
+    expect(JSON.stringify(results[0])).not.toContain("paid_tool");
+    expect(JSON.stringify(results[1])).not.toContain("trace");
+  });
+
+  it("gives a failure hook the call when the scheme rejects the transport", async () => {
+    let seen = "";
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload() {
+        throw new Error("unsupported_call_transport");
+      },
+    };
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+    client.onPaymentCreationFailure(async context => {
+      if (context.call?.transport === "mcp") {
+        seen = context.call.toolCall.name;
+      }
+      expect(context.error.message).toBe("unsupported_call_transport");
+    });
+    await expect(
+      client.createPaymentPayload(required(), {
+        call: { transport: "mcp", toolCall: { name: "paid_tool", arguments: { article: "one" } } },
+      }),
+    ).rejects.toThrow("unsupported_call_transport");
+    expect(seen).toBe("paid_tool");
+  });
+
+  it("forwards call context through the HTTP client and still accepts a missing call", async () => {
+    const scheme = new MockSchemeNetworkClient("test-scheme");
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+    const http = new x402HTTPClient(client);
+    await http.createPaymentPayload(required());
+    await http.createPaymentPayload(required(), httpCall("https://pay.example/http"));
+    expect(scheme.createPaymentPayloadCalls[0].context?.call).toBeUndefined();
+    expect(scheme.createPaymentPayloadCalls[1].context?.call).toMatchObject({
+      transport: "http",
+      request: { method: "POST", url: "https://pay.example/http" },
+    });
+  });
+
+  it("fail-closes malformed or unsupported context before signing", async () => {
+    const scheme = new MockSchemeNetworkClient("test-scheme");
+    const client = new x402Client().register(network, scheme).setSpendControls(false);
+    const headers = new Headers({
+      "X-Request-Id": "id-1",
+      "Payment-Signature": "sig",
+      "X-Payment": "old",
+    });
+    const protoHeaders = JSON.parse('{"__proto__": "polluted", "x-request-id": "id-2"}') as Record<
+      string,
+      string
+    >;
+    await client.createPaymentPayload(required(), {
+      call: {
+        transport: "http",
+        request: { method: "GET", url: "https://pay.example/headers", headers },
+      },
+    });
+    const copied = scheme.createPaymentPayloadCalls[0].context?.call;
+    if (copied?.transport !== "http") {
+      throw new Error("request_context_missing");
+    }
+    expect(Object.getPrototypeOf(copied.request.headers)).toBeNull();
+    expect(copied.request.headers["x-request-id"]).toBe("id-1");
+    expect(copied.request.headers["payment-signature"]).toBeUndefined();
+    expect(copied.request.headers["x-payment"]).toBeUndefined();
+    expect(copied.request.getBody).toBeUndefined();
+
+    await client.createPaymentPayload(required(), {
+      call: {
+        transport: "http",
+        request: {
+          method: "GET",
+          url: "https://pay.example/proto",
+          headers: protoHeaders,
+        },
+      },
+    });
+    await client.createPaymentPayload(required(), {
+      call: {
+        transport: "http",
+        request: {
+          method: "GET",
+          url: "https://pay.example/join",
+          headers: { "": "skip", "X-Request-Id": "id-3", "x-request-id": "id-4" },
+        },
+      },
+    });
+    const protoCall = scheme.createPaymentPayloadCalls[1].context?.call;
+    if (protoCall?.transport !== "http") {
+      throw new Error("request_context_missing");
+    }
+    expect(protoCall.request.headers["__proto__"]).toBe("polluted");
+    expect(protoCall.request.headers["x-request-id"]).toBe("id-2");
+    expect(({} as { polluted?: string }).polluted).toBeUndefined();
+    const joined = scheme.createPaymentPayloadCalls[2].context?.call;
+    if (joined?.transport !== "http") {
+      throw new Error("request_context_missing");
+    }
+    expect(joined.request.headers[""]).toBeUndefined();
+    expect(joined.request.headers["x-request-id"]).toBe("id-3, id-4");
+
+    const rejected = [
+      null,
+      [],
+      { transport: "http" },
+      { call: null },
+      { call: { transport: "grpc" } },
+      { call: { transport: "http" } },
+      {
+        call: {
+          transport: "http",
+          request: { method: "", url: "https://pay.example", headers: {} },
+        },
+      },
+      { call: { transport: "http", request: { method: "GET", url: "", headers: {} } } },
+      {
+        call: {
+          transport: "http",
+          request: { method: "GET", url: "https://pay.example", headers: [] },
+        },
+      },
+      {
+        call: {
+          transport: "http",
+          request: { method: "GET", url: "https://pay.example", headers: { a: 1 } },
+        },
+      },
+      {
+        call: {
+          transport: "http",
+          request: { method: "GET", url: "https://pay.example", headers: {}, getBody: 1 },
+        },
+      },
+      { call: { transport: "mcp" } },
+      { call: { transport: "mcp", toolCall: { name: "" } } },
+      { call: { transport: "mcp", toolCall: { name: "tool", arguments: [] } } },
+      { call: { transport: "mcp", toolCall: { name: "tool", meta: [] } } },
+      {
+        call: { transport: "mcp", toolCall: { name: "tool", arguments: { fn: () => undefined } } },
+      },
+    ];
+    for (const options of rejected) {
+      await expect(client.createPaymentPayload(required(), options as never)).rejects.toThrow(
+        /invalid_|unsupported_/,
+      );
+    }
+    expect(scheme.createPaymentPayloadCalls).toHaveLength(3);
+
+    const absent = await client.createPaymentPayload(required(), {});
+    await client.createPaymentPayload(required(), { call: undefined });
+    expect(absent.accepted.payTo).toBe("test_recipient");
+    expect(scheme.createPaymentPayloadCalls[3].context?.call).toBeUndefined();
+    expect(scheme.createPaymentPayloadCalls[4].context?.call).toBeUndefined();
+  });
+
+  it("passes a v1 scheme the same per-call context", async () => {
+    const seen: PaymentPayloadContext[] = [];
+    const scheme: SchemeNetworkClient = {
+      scheme: "test-scheme",
+      async createPaymentPayload(_version, _requirements, context) {
+        if (context) seen.push(context);
+        return { x402Version: 1, payload: { signature: "v1_signature" } };
+      },
+    };
+    const client = new x402Client().registerV1("base-sepolia", scheme).setSpendControls(false);
+    await client.createPaymentPayload(
+      buildPaymentRequired({
+        x402Version: 1,
+        accepts: [
+          {
+            ...buildPaymentRequirements({
+              scheme: "test-scheme",
+              network: "base-sepolia" as Network,
+            }),
+            maxAmountRequired: "1000000",
+          } as PaymentRequired["accepts"][number],
+        ],
+      }),
+      httpCall("https://pay.example/v1"),
+    );
+    expect(seen[0].call?.transport).toBe("http");
+  });
+});
+
+async function viWait(ready: () => boolean): Promise<void> {
+  const started = Date.now();
+  while (!ready()) {
+    if (Date.now() - started > 1000) {
+      throw new Error("timed out waiting for concurrent calls");
+    }
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
