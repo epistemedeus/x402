@@ -12,10 +12,11 @@ import type {
   BatchSettlementPaymentRequirementsExtra,
   BatchSettlementRefundPayload,
 } from "../types";
-import { computeChannelId } from "../utils";
+import { computeChannelId, sameAssertedTransactionHash } from "../utils";
 import { type BatchSettlementClientDeps, buildChannelConfig, recoverChannel } from "./channel";
 import { createBatchSettlementClientHooks } from "./hooks";
 import { signVoucher } from "./voucher";
+import { batchOperationFingerprint } from "../facilitator/operation";
 
 /**
  * Refund-specific server errors that the client cannot recover from automatically.
@@ -26,6 +27,55 @@ const NON_RECOVERABLE_REFUND_ERRORS: ReadonlySet<string> = new Set([
   Errors.ErrRefundNoBalance,
   Errors.ErrRefundAmountInvalid,
 ]);
+
+/** One original HTTP refund on its existing live client, not a new transaction service. */
+export interface RefundAttempt {
+  url: string;
+  fetchImpl: typeof fetch;
+  binding: string;
+  payload?: PaymentPayload;
+  unknown: boolean;
+  submitted: boolean;
+  transaction?: string;
+  /** Frozen min(requested, refundable) for this original operation. */
+  effectiveAmount?: string;
+  payer?: string;
+  /** Original refund nonce, when the client had one to freeze. */
+  nonce?: string;
+  flight?: Promise<SettleResponse>;
+}
+
+/**
+ * The amount a client may apply: the requested amount clamped to the local remainder.
+ * Without a local balance, an omitted amount stays an unconstrained full refund.
+ *
+ * @param requested - Amount on the signed payload, or undefined for a full refund
+ * @param balance - Local channel balance, when known
+ * @param charged - Local charged cumulative amount
+ * @returns The admitted amount, or a flag that local state cannot name one
+ */
+export function admittedClientRefundAmount(
+  requested: string | undefined,
+  balance: string | undefined,
+  charged: string | undefined,
+): { effective?: string; unconstrainedFull: boolean } {
+  if (balance === undefined || !/^\d+$/.test(balance)) {
+    if (requested === undefined) return { unconstrainedFull: true };
+    return { effective: requested, unconstrainedFull: false };
+  }
+  const chargedAmount = charged !== undefined && /^\d+$/.test(charged) ? BigInt(charged) : 0n;
+  const remainder = BigInt(balance) - chargedAmount;
+  if (remainder <= 0n) return { effective: "0", unconstrainedFull: false };
+  if (requested === undefined) return { effective: remainder.toString(), unconstrainedFull: false };
+  if (!/^\d+$/.test(requested) || BigInt(requested) <= 0n) {
+    return { effective: "0", unconstrainedFull: false };
+  }
+  const requestedAmount = BigInt(requested);
+  return {
+    effective: (requestedAmount > remainder ? remainder : requestedAmount).toString(),
+    unconstrainedFull: false,
+  };
+}
 
 interface RefundRequirementsProbe {
   paymentRequired: PaymentRequired;
@@ -71,7 +121,72 @@ export async function refundChannel(
 
   const refundAmount = normalizeRefundAmount(options?.amount);
   const probe = await probeRefundRequirements(url, fetchImpl);
-  return executeRefund(ctx, url, probe, refundAmount, fetchImpl);
+  const config = buildChannelConfig(ctx, probe.requirements);
+  const key = computeChannelId(config, probe.requirements.network).toLowerCase();
+  const channel = await ctx.storage.get(key);
+  const binding = refundBinding(url, probe, refundAmount, channel?.chargedCumulativeAmount ?? "0");
+  const attempts = ctx.refundAttempts ?? (ctx.refundAttempts = new Map());
+  const previous =
+    attempts.get(key) ?? Array.from(attempts.values()).find(entry => entry.url === url);
+  if (previous && previous.binding !== binding) {
+    throw new Error(
+      "Refund outcome unknown: original request remains unresolved; changed terms were not signed",
+    );
+  }
+  if (previous && previous.fetchImpl !== fetchImpl) {
+    throw new Error(
+      "Refund outcome unknown: original transport remains unresolved; no provider switch was submitted",
+    );
+  }
+  if (previous?.flight) return previous.flight;
+  const operation: RefundAttempt = previous ?? {
+    url,
+    fetchImpl,
+    binding,
+    unknown: false,
+    submitted: false,
+  };
+  const flight = Promise.resolve().then(() =>
+    executeRefund(ctx, url, probe, refundAmount, fetchImpl, key, operation),
+  );
+  operation.flight = flight;
+  attempts.set(key, operation);
+  try {
+    return await flight;
+  } catch (error) {
+    if (attempts.get(key) === operation) {
+      if (operation.submitted) operation.unknown = true;
+      else attempts.delete(key);
+    }
+    throw error;
+  } finally {
+    operation.flight = undefined;
+  }
+}
+
+/**
+ * Binds the original refund intent, channel ceiling, route, and advertised terms.
+ *
+ * @param url - Original receiving route.
+ * @param probe - Its complete requirements and resource metadata.
+ * @param refundAmount - Explicit amount, or the original full-refund intent.
+ * @param charged - Original cumulative voucher ceiling.
+ * @returns A stable request binding that does not create financial truth.
+ */
+function refundBinding(
+  url: string,
+  probe: RefundRequirementsProbe,
+  refundAmount: string | undefined,
+  charged: string,
+): string {
+  return batchOperationFingerprint({
+    url,
+    requirements: probe.requirements,
+    resource: probe.paymentRequired.resource,
+    extensions: probe.paymentRequired.extensions,
+    refundAmount,
+    charged,
+  });
 }
 
 /**
@@ -111,6 +226,66 @@ async function probeRefundRequirements(
 }
 
 /**
+ * Records one PAYMENT-RESPONSE against the original refund attempt.
+ * A same-network 32-byte hash is retained before acceptance can reject it.
+ * A conflicting hash or an uncertain refusal stays unknown and reserved.
+ *
+ * @param ctx - Client dependencies that own the in-process attempt map
+ * @param key - Channel key for this attempt
+ * @param operation - Frozen refund attempt
+ * @param observed - Decoded settle response
+ * @param network - Network the request was admitted on
+ */
+function recordRefundHeader(
+  ctx: BatchSettlementClientDeps,
+  key: string,
+  operation: RefundAttempt,
+  observed: SettleResponse,
+  network: string,
+): void {
+  if (
+    observed.success &&
+    observed.network === network &&
+    operation.transaction === undefined &&
+    /^0x[0-9a-fA-F]{64}$/.test(observed.transaction)
+  ) {
+    operation.transaction = observed.transaction;
+  }
+  if (
+    observed.success &&
+    operation.transaction !== undefined &&
+    operation.transaction.toLowerCase() !== observed.transaction.toLowerCase()
+  ) {
+    throw new Error("Refund outcome unknown: response names a different original transaction");
+  }
+  if (observed.success || observed.network !== network) {
+    return;
+  }
+  const knownRefusal =
+    observed.transaction === "" &&
+    [
+      Errors.ErrRefundNoBalance,
+      Errors.ErrRefundAmountInvalid,
+      Errors.ErrRefundSimulationFailed,
+      Errors.ErrAuthorizerNotConfigured,
+      Errors.ErrAuthorizerAddressMismatch,
+    ].includes(observed.errorReason ?? "");
+  const confirmedRevert =
+    observed.errorReason === Errors.ErrRefundTransactionFailed &&
+    /^0x[0-9a-fA-F]{64}$/.test(observed.transaction) &&
+    (!operation.unknown ||
+      sameAssertedTransactionHash(operation.transaction, observed.transaction));
+  if ((!operation.unknown && knownRefusal) || confirmedRevert) {
+    if (ctx.refundAttempts?.get(key) === operation) ctx.refundAttempts.delete(key);
+    return;
+  }
+  operation.unknown = true;
+  if (operation.transaction === undefined && /^0x[0-9a-fA-F]{64}$/.test(observed.transaction)) {
+    operation.transaction = observed.transaction;
+  }
+}
+
+/**
  * Builds and submits the refund voucher, retrying once after a corrective 402.
  *
  * @param ctx - Identity inputs (storage, signers, salt, payerAuthorizer).
@@ -118,6 +293,8 @@ async function probeRefundRequirements(
  * @param probe - Resolved payment requirements and probe metadata for this channel.
  * @param refundAmount - Optional partial refund amount in token base units.
  * @param fetchImpl - Fetch implementation used for the request.
+ * @param key - Original chain-bound channel key.
+ * @param operation - Original request and in-process receipt continuity.
  * @returns The parsed settle response.
  */
 async function executeRefund(
@@ -126,23 +303,63 @@ async function executeRefund(
   probe: RefundRequirementsProbe,
   refundAmount: string | undefined,
   fetchImpl: typeof fetch,
+  key: string,
+  operation: RefundAttempt,
 ): Promise<SettleResponse> {
   const maxAttempts = 2;
   const { paymentRequired, requirements } = probe;
   const httpClient = createRefundHttpClient(ctx, requirements);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const paymentPayload = await buildRefundPaymentPayload(
-      ctx,
-      paymentRequired,
-      requirements,
+    const paymentPayload =
+      operation.payload ??
+      (await buildRefundPaymentPayload(ctx, paymentRequired, requirements, refundAmount));
+    operation.payload = structuredClone(paymentPayload);
+    if (operation.effectiveAmount === undefined) {
+      const raw = paymentPayload.payload as unknown as BatchSettlementRefundPayload;
+      const stored = await ctx.storage.get(key);
+      const admitted = admittedClientRefundAmount(
+        raw.amount,
+        stored?.balance,
+        stored?.chargedCumulativeAmount,
+      );
+      if (admitted.effective !== undefined) operation.effectiveAmount = admitted.effective;
+      operation.payer = raw.channelConfig.payer;
+    }
+    operation.binding = refundBinding(
+      url,
+      probe,
       refundAmount,
+      (paymentPayload.payload as unknown as BatchSettlementRefundPayload).voucher
+        .maxClaimableAmount,
     );
     const headers = httpClient.encodePaymentSignatureHeader(paymentPayload);
 
+    operation.submitted = true;
     const response = await fetchImpl(url, { method: "GET", headers });
+    const settleHeader = response.headers.get("PAYMENT-RESPONSE");
+    if (settleHeader) {
+      recordRefundHeader(
+        ctx,
+        key,
+        operation,
+        decodePaymentResponseHeader(settleHeader),
+        requirements.network,
+      );
+    }
 
     if (response.status === 402) {
+      if (!settleHeader && operation.unknown) {
+        throw new Error(
+          "Refund outcome unknown: a corrective response cannot replace the original pending request",
+        );
+      }
+      if (
+        !settleHeader &&
+        NON_RECOVERABLE_REFUND_ERRORS.has(getRefundPaymentRequired(response).error ?? "")
+      ) {
+        if (ctx.refundAttempts?.get(key) === operation) ctx.refundAttempts.delete(key);
+      }
       const nonRecoverable = getNonRecoverableRefundFailure(response);
       if (nonRecoverable) {
         throw new Error(nonRecoverable);
@@ -155,8 +372,17 @@ async function executeRefund(
       response.status,
     );
 
+    if (result.recovered && (operation.unknown || operation.transaction)) {
+      throw new Error(
+        "Refund outcome unknown: a corrective response cannot replace the original pending request",
+      );
+    }
+
     if (response.status === 402) {
       if (result.recovered && attempt < maxAttempts) {
+        // This is an explicit pre-settlement corrective response, not receipt uncertainty.
+        operation.payload = undefined;
+        operation.submitted = false;
         continue;
       }
       if (result.recovered) {
@@ -173,7 +399,15 @@ async function executeRefund(
       );
     }
 
-    return result.settleResponse;
+    if (result.settleResponse.success) {
+      if (ctx.refundAttempts?.get(key) === operation) ctx.refundAttempts.delete(key);
+      return result.settleResponse;
+    }
+    operation.unknown = true;
+    throw new Error(
+      result.settleResponse.errorMessage ||
+        `Refund outcome unknown: ${result.settleResponse.errorReason || "settlement was not confirmed"}`,
+    );
   }
 
   throw new Error("Refund failed: retry budget exhausted");

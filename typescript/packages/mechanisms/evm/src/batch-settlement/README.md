@@ -151,6 +151,77 @@ await manager.claimAndSettle({
 });
 ```
 
+### Receiving refund claims and graceful shutdown
+
+A cooperative refund can claim vouchers without transferring those funds to the
+receiver. Removing the refunded channel from storage does not remove the
+receiver's settlement obligation. Supply a scoped chain reader when the manager
+must receive client refunds or claims made outside its process:
+
+```typescript
+import { readBatchSettlementReceiverState } from "@x402/evm/batch-settlement/server";
+
+const manager = scheme.createChannelManager(facilitatorClient, network, token, {
+  readReceiverSettlement: scope => readBatchSettlementReceiverState(publicClient, scope),
+});
+const result = await manager.settle();
+if (result.outcome === "settled") {
+  recordConfirmedProviderTransaction(result.transaction);
+} else {
+  // A verified equal receiver/token pair has no transaction or amount.
+  recordAlreadySettled();
+}
+await manager.stop({ flush: true });
+```
+
+The reader checks a canonical safe unsigned `eip155` reference, the client's
+configured chain, and `eth_chainId` from the connected RPC before reading
+`receivers(receiver, token)`. Custom readers must preserve this scope and return
+nonnegative bigint totals with `totalSettled <= totalClaimed`. Equal totals permit
+an `already-settled` result only while no newer local claim obligation or unknown
+effect exists. A reported transfer additionally needs a canonical transaction
+hash, a positive amount, the exact network, and a corresponding increase in the
+scoped settled total. That increase does not attribute the returned hash.
+
+Without a reader, the manager retains only its local claim/refund hint and a
+well-formed provider response remains a provider assertion. It cannot discover
+client refunds after their channel row is removed. A claim obligation is recorded
+before submission and survives a storage-update failure. Matching concurrent
+claims or refunds share their original submission and authorizer signatures;
+changed in-flight policies or refund amounts are refused. Batch sizes must be
+positive safe integers. Shared storage and custom selectors cannot widen a
+manager's network, receiver, or token scope.
+
+`stop()` waits for admitted direct operations as well as auto jobs, including
+rejected work. Repeated stops share a drain; `flush` runs after admitted work.
+Hooks may await `stop()` without waiting on themselves. Stopping and restarting
+does not clear an unknown financial effect or replenish capacity. An unknown,
+pending, malformed, or foreign provider response leaves the manager quarantined;
+receiver equality alone cannot release it.
+
+The existing facilitator instance retains an exact unresolved claim, refund, or
+settle request and its original receipt continuation. The full payload, accepted
+terms, resolved suffix, payer/channel, receiver, token, amount, and network remain
+bound. An exact retry waits for that transaction without signing or broadcasting
+again. A changed request is a busy refusal and was not submitted. A lost write
+reply with no usable hash remains unknown and cannot be resent. These batch
+records do not expire; the existing deposit pending store is unchanged. The
+resource-server scheme also retains the exact original HTTP refund verification
+and signed enrichment across uncertain replies. An exact retry resumes that
+operation instead of verifying a new refund against its already changed balance.
+The live SDK client retains that full request and original payer signature too.
+Matching concurrent calls share it; retries do not re-sign its voucher, and
+changed channel ceilings, routes, amounts, or terms are refused before signing.
+Changed requests are refused while it is unresolved. Its old verification is an
+original observation, not fresh chain state. Admission generations protect new
+operations from late cleanup. Confirmed receiver/provider output must pass the
+refund consumer's network, hash, and positive-amount checks before changing
+client capacity; foreign or malformed success assertions stay unknown.
+These records are process-local, so process replacement and concurrent independent facilitator
+replicas still need an independently received recovery decision. A confirmed
+receipt continuation does not automatically release a manager that previously
+received an unknown response.
+
 ### Receiver Authorizer
 
 The `receiverAuthorizer` signs `ClaimBatch` and `Refund` EIP-712 messages and is committed into the channel's identity at deposit time:

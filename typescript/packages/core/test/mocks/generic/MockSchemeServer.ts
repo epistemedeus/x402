@@ -18,6 +18,7 @@ export class MockSchemeNetworkServer implements SchemeNetworkServer {
   };
   public readonly schemeHooks?: SchemeServerHooks;
   public settleOnCancel?: SchemeNetworkServer["settleOnCancel"];
+  public acceptSettlementResult?: SchemeNetworkServer["acceptSettlementResult"];
   private parsePriceResult: AssetAmount | Error;
   private enhanceResult: PaymentRequirements | Error | null = null;
   private assetDecimalsResult: number | undefined | null = null;

@@ -13,6 +13,7 @@ import type {
   OnVerifiedPaymentCanceledHook,
   SettleContext,
   SettleResultContext,
+  SettlementResultAcceptance,
   VerifiedPaymentCanceledContext,
 } from "../server/x402ResourceServer";
 import type {
@@ -260,6 +261,15 @@ export interface SchemeNetworkServer {
   enrichPaymentRequiredResponse?: SchemeEnrichPaymentRequiredResponseHook;
   enrichSettlementPayload?: SchemeEnrichSettlementPayloadHook;
   enrichSettlementResponse?: SchemeEnrichSettlementResponseHook;
+  /**
+   * Optional financial acceptance of a facilitator or skipped settle result.
+   * Core calls it after a successful result and before ordinary afterSettle observers.
+   * Throw or return `unresolved` to quarantine that operation. Do not use this for logging.
+   *
+   * @param context - Settle result, original payload, and requirements
+   * @returns Acceptance, an unresolved retry identity, or void for schemes that do not opt in
+   */
+  acceptSettlementResult?(context: SettleResultContext): Promise<SettlementResultAcceptance | void>;
 
   /**
    * Optional: return payment requirements to settle when a verified payment is

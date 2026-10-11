@@ -19,6 +19,7 @@ import type {
   SettleResponse,
 } from "@x402/core/types";
 import { x402ResourceServer, type FacilitatorClient } from "@x402/core/server";
+import { SettleError } from "@x402/core/types";
 import { privateKeyToAccount } from "viem/accounts";
 import * as Errors from "../../../src/batch-settlement/errors";
 
@@ -2800,7 +2801,8 @@ describe("BatchSettlementChannelManager — getClaimableVouchers", () => {
     const facilitator = {
       settle: vi.fn(async () => ({
         success: true,
-        transaction: "0xclaim",
+        network: NETWORK,
+        transaction: `0x${"ab".repeat(32)}`,
       })),
     } as unknown as FacilitatorClient;
     const claimManager = new BatchSettlementChannelManager({
@@ -2813,7 +2815,7 @@ describe("BatchSettlementChannelManager — getClaimableVouchers", () => {
 
     const results = await claimManager.claim();
 
-    expect(results).toEqual([{ vouchers: 1, transaction: "0xclaim" }]);
+    expect(results).toEqual([{ vouchers: 1, transaction: `0x${"ab".repeat(32)}` }]);
     const updated = await storage.get(channelId);
     expect(updated?.totalClaimed).toBe("5000");
     expect(updated?.pendingRequest?.pendingId).toBe("pending");
@@ -2907,5 +2909,296 @@ describe("BatchSettlementChannelManager — getWithdrawalPendingSessions", () =>
     const result = await manager.getWithdrawalPendingSessions();
     expect(result).toHaveLength(1);
     expect(result[0].channelId).toBe(id2);
+  });
+});
+
+describe("211204 retained HTTP refund receiving", () => {
+  const tx = `0x${"ab".repeat(32)}`;
+  async function admittedRefund() {
+    const signer = buildAuthorizerSigner();
+    const signing = vi.spyOn(signer, "signTypedData");
+    const storage = new InMemoryChannelStorage();
+    const server = new BatchSettlementEvmScheme(RECEIVER, {
+      storage,
+      receiverAuthorizerSigner: signer,
+    });
+    const config = buildChannelConfig({ receiverAuthorizer: signer.address });
+    const channelId = computeChannelId(config);
+    const requirements = makeRequirements({ extra: { receiverAuthorizer: signer.address } });
+    const payload = buildRefundPayload(channelId, "3000", config);
+    payload.accepted = requirements;
+    await storeChannel(storage, channelId, {
+      channelId,
+      channelConfig: config,
+      chargedCumulativeAmount: "3000",
+      signedMaxClaimable: "3000",
+      signature: "0xdeadbeef",
+      balance: "10000",
+      totalClaimed: "0",
+      withdrawRequestedAt: 0,
+      refundNonce: 0,
+      lastRequestTimestamp: Date.now(),
+    });
+    const result: VerifyResponse = {
+      isValid: true,
+      payer: PAYER,
+      extra: { balance: "10000", totalClaimed: "0", refundNonce: 0, withdrawRequestedAt: 0 },
+    };
+    await runBeforeVerify(server, payload, requirements);
+    await server.schemeHooks.onAfterVerify!({
+      paymentPayload: payload,
+      requirements,
+      result,
+    } as never);
+    const enrichment = await server.enrichSettlementPayload({
+      paymentPayload: payload,
+      requirements,
+    } as never);
+    const generation = server.readRetainedRefund(channelId)!.generation;
+    return {
+      server,
+      storage,
+      channelId,
+      requirements,
+      payload,
+      result,
+      enrichment,
+      signing,
+      generation,
+    };
+  }
+  async function fail(
+    original: Awaited<ReturnType<typeof admittedRefund>>,
+    error = new SettleError(500, {
+      success: false,
+      errorReason: "settlement_pending",
+      transaction: tx,
+      network: NETWORK,
+    }),
+  ) {
+    await original.server.schemeHooks.onSettleFailure!({
+      paymentPayload: original.payload,
+      requirements: original.requirements,
+      error,
+    } as never);
+  }
+  async function resume(original: Awaited<ReturnType<typeof admittedRefund>>) {
+    const payload = structuredClone(original.payload);
+    const directive = await original.server.schemeHooks.onBeforeVerify!({
+      paymentPayload: payload,
+      requirements: original.requirements,
+    } as never);
+    expect(directive).toEqual({ skip: true, result: original.result });
+    await original.server.schemeHooks.onAfterVerify!({
+      paymentPayload: payload,
+      requirements: original.requirements,
+      result: original.result,
+    } as never);
+    const enrichment = await original.server.enrichSettlementPayload({
+      paymentPayload: payload,
+      requirements: original.requirements,
+    } as never);
+    expect(enrichment).toEqual(original.enrichment);
+    expect(original.signing).toHaveBeenCalledTimes(2);
+    return payload;
+  }
+  it("resumes the original verified refund and signed enrichment, then releases only after confirmed state update", async () => {
+    const original = await admittedRefund();
+    await fail(original);
+    expect(original.server.readRetainedRefund(original.channelId)).toMatchObject({
+      unresolved: true,
+      transaction: tx,
+    });
+    const payload = await resume(original);
+    await original.server.schemeHooks.onAfterSettle!({
+      paymentPayload: payload,
+      requirements: original.requirements,
+      result: {
+        success: true,
+        transaction: tx,
+        network: NETWORK,
+        amount: "7000",
+        extra: {
+          channelState: {
+            channelId: original.channelId,
+            balance: "3000",
+            totalClaimed: "3000",
+            refundNonce: "1",
+            withdrawRequestedAt: 0,
+          },
+        },
+      },
+    } as never);
+    expect(await original.storage.get(original.channelId)).toBeUndefined();
+    expect(original.server.readRetainedRefund(original.channelId)).toBeUndefined();
+  });
+  it.each(["explicit-amount", "voucher", "signature", "payee", "terms", "payment"])(
+    "refuses changed %s while the original refund is unresolved",
+    async field => {
+      const original = await admittedRefund();
+      await fail(original);
+      const payload = structuredClone(original.payload);
+      const requirements = structuredClone(original.requirements);
+      if (field === "explicit-amount") payload.payload.amount = "7000";
+      if (field === "voucher")
+        (payload.payload.voucher as { maxClaimableAmount: string }).maxClaimableAmount = "3001";
+      if (field === "signature")
+        (payload.payload.voucher as { signature: string }).signature = "0xabcd";
+      if (field === "payee") requirements.payTo = PAYER;
+      if (field === "terms") requirements.maxTimeoutSeconds = 1;
+      if (field === "payment") payload.payload.type = "voucher";
+      const directive = await original.server.schemeHooks.onBeforeVerify!({
+        paymentPayload: payload,
+        requirements,
+      } as never);
+      expect(directive).toMatchObject({ abort: true, reason: Errors.ErrChannelBusy });
+      expect(original.server.readRetainedRefund(original.channelId)?.generation).toBe(
+        original.generation,
+      );
+      expect(original.signing).toHaveBeenCalledTimes(2);
+    },
+  );
+  it("keeps unknown financial admission after the request reservation expires", async () => {
+    const original = await admittedRefund();
+    await fail(original);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 24 * 60 * 60 * 1000);
+      await resume(original);
+      expect(original.server.readRetainedRefund(original.channelId)?.unresolved).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("does not let no-balance turn an already unknown original refund into a refusal", async () => {
+    const original = await admittedRefund();
+    await fail(original);
+    const payload = await resume(original);
+    await original.server.schemeHooks.onSettleFailure!({
+      paymentPayload: payload,
+      requirements: original.requirements,
+      error: new SettleError(500, {
+        success: false,
+        errorReason: Errors.ErrRefundNoBalance,
+        transaction: "",
+        network: NETWORK,
+      }),
+    } as never);
+    expect(original.server.readRetainedRefund(original.channelId)).toMatchObject({
+      unresolved: true,
+      transaction: tx,
+    });
+    expect((await original.storage.get(original.channelId))?.balance).toBe("10000");
+  });
+  it("releases a known prebroadcast refusal without discarding an uncertain original effect", async () => {
+    const original = await admittedRefund();
+    await fail(
+      original,
+      new SettleError(500, {
+        success: false,
+        errorReason: Errors.ErrRefundSimulationFailed,
+        transaction: "",
+        network: NETWORK,
+      }),
+    );
+    expect(original.server.readRetainedRefund(original.channelId)).toBeUndefined();
+  });
+  it("releases a confirmed revert of the stored hash when only the hex case differs", async () => {
+    const original = await admittedRefund();
+    const upper = `0x${"AB".repeat(32)}`;
+    await fail(
+      original,
+      new SettleError(500, {
+        success: false,
+        errorReason: "settlement_pending",
+        transaction: upper,
+        network: NETWORK,
+      }),
+    );
+    expect(original.server.readRetainedRefund(original.channelId)).toMatchObject({
+      unresolved: true,
+      transaction: upper,
+    });
+    const payload = await resume(original);
+    await original.server.schemeHooks.onSettleFailure!({
+      paymentPayload: payload,
+      requirements: original.requirements,
+      error: new SettleError(500, {
+        success: false,
+        errorReason: Errors.ErrRefundTransactionFailed,
+        transaction: tx,
+        network: NETWORK,
+      }),
+    } as never);
+    expect(original.server.readRetainedRefund(original.channelId)).toBeUndefined();
+    expect((await original.storage.get(original.channelId))?.balance).toBe("10000");
+  });
+  it("does not release a confirmed revert that names another hash, a malformed hash, or another network", async () => {
+    const distinct = await admittedRefund();
+    await fail(distinct);
+    const distinctPayload = await resume(distinct);
+    await distinct.server.schemeHooks.onSettleFailure!({
+      paymentPayload: distinctPayload,
+      requirements: distinct.requirements,
+      error: new SettleError(500, {
+        success: false,
+        errorReason: Errors.ErrRefundTransactionFailed,
+        transaction: `0x${"cd".repeat(32)}`,
+        network: NETWORK,
+      }),
+    } as never);
+    expect(distinct.server.readRetainedRefund(distinct.channelId)).toMatchObject({
+      unresolved: true,
+      transaction: tx,
+    });
+
+    const malformed = await admittedRefund();
+    await fail(malformed);
+    const malformedPayload = await resume(malformed);
+    await malformed.server.schemeHooks.onSettleFailure!({
+      paymentPayload: malformedPayload,
+      requirements: malformed.requirements,
+      error: new SettleError(500, {
+        success: false,
+        errorReason: Errors.ErrRefundTransactionFailed,
+        transaction: "0x1234",
+        network: NETWORK,
+      }),
+    } as never);
+    expect(malformed.server.readRetainedRefund(malformed.channelId)).toMatchObject({
+      unresolved: true,
+      transaction: tx,
+    });
+
+    const foreign = await admittedRefund();
+    await fail(foreign);
+    const foreignPayload = await resume(foreign);
+    await foreign.server.schemeHooks.onSettleFailure!({
+      paymentPayload: foreignPayload,
+      requirements: foreign.requirements,
+      error: new SettleError(500, {
+        success: false,
+        errorReason: Errors.ErrRefundTransactionFailed,
+        transaction: tx,
+        network: "eip155:1" as typeof NETWORK,
+      }),
+    } as never);
+    expect(foreign.server.readRetainedRefund(foreign.channelId)).toMatchObject({
+      unresolved: true,
+      transaction: tx,
+    });
+    expect((await foreign.storage.get(foreign.channelId))?.balance).toBe("10000");
+  });
+  it("stale same-binding cleanup cannot erase a newer admitted generation", async () => {
+    const original = await admittedRefund();
+    const retained = original.server.readRetainedRefund(original.channelId)!;
+    const newer = original.server.retainRefund(original.channelId, retained);
+    expect(newer).toBeGreaterThan(original.generation);
+    original.server.releaseRetainedRefund(
+      original.channelId,
+      retained.binding,
+      original.generation,
+    );
+    expect(original.server.readRetainedRefund(original.channelId)?.generation).toBe(newer);
   });
 });

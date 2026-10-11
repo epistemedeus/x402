@@ -25,6 +25,10 @@ import { executeSettle } from "./settle";
 import { executeRefundWithSignature } from "./refund";
 import { resolveDataSuffix } from "../../shared/extensions";
 import * as Errors from "../errors";
+import { ErrSettlementPending } from "../../exact/facilitator/errors";
+import { batchOperationFingerprint, type BatchOperation } from "./operation";
+import { unsignedEip155ChainId } from "../server/receiverState";
+import { computeChannelId } from "../utils";
 
 export interface BatchSettlementEvmSchemeConfig {
   /**
@@ -61,6 +65,7 @@ export class BatchSettlementEvmScheme implements SchemeNetworkFacilitator {
   readonly caipFamily = "eip155:*";
   private readonly config: Required<Omit<BatchSettlementEvmSchemeConfig, "pendingSettlementStore">>;
   private readonly pendingStore: PendingSettlementStore;
+  private readonly batchOperations = new Map<string, BatchOperation>();
 
   /**
    * Creates a facilitator scheme for verifying and settling batch-settlement payments.
@@ -182,6 +187,10 @@ export class BatchSettlementEvmScheme implements SchemeNetworkFacilitator {
     requirements: PaymentRequirements,
     context?: FacilitatorContext,
   ): Promise<SettleResponse> {
+    // A caller may mutate its objects while an RPC or extension resolves.
+    // The admitted operation always retains its original wire input and terms.
+    payload = structuredClone(payload);
+    requirements = structuredClone(requirements);
     const rawPayload = payload.payload;
 
     const dataSuffix = await resolveDataSuffix(context, {
@@ -203,27 +212,56 @@ export class BatchSettlementEvmScheme implements SchemeNetworkFacilitator {
     }
 
     if (isBatchSettlementClaimPayload(rawPayload)) {
-      return executeClaimWithSignature(
-        this.signer,
-        rawPayload,
+      return this.runBatchOperation(
+        payload,
         requirements,
-        this.authorizerSigner,
         dataSuffix,
+        rawPayload.claims.flatMap(claim => [
+          `config:${batchOperationFingerprint(claim.voucher.channel)}`,
+          `channel:${computeChannelId(claim.voucher.channel, requirements.network).toLowerCase()}`,
+        ]),
+        (signer, operation) =>
+          executeClaimWithSignature(
+            signer,
+            rawPayload,
+            requirements,
+            this.authorizerSigner,
+            dataSuffix,
+            operation,
+          ),
       );
     }
 
     if (isBatchSettlementEnrichedRefundPayload(rawPayload)) {
-      return executeRefundWithSignature(
-        this.signer,
-        rawPayload,
+      return this.runBatchOperation(
+        payload,
         requirements,
-        this.authorizerSigner,
         dataSuffix,
+        [
+          `config:${batchOperationFingerprint(rawPayload.channelConfig)}`,
+          `channel:${rawPayload.voucher.channelId.toLowerCase()}`,
+        ],
+        (signer, operation) =>
+          executeRefundWithSignature(
+            signer,
+            rawPayload,
+            requirements,
+            this.authorizerSigner,
+            dataSuffix,
+            operation,
+          ),
       );
     }
 
     if (isBatchSettlementSettlePayload(rawPayload)) {
-      return executeSettle(this.signer, rawPayload, requirements, dataSuffix);
+      return this.runBatchOperation(
+        payload,
+        requirements,
+        dataSuffix,
+        [`receiver:${rawPayload.receiver.toLowerCase()}:${rawPayload.token.toLowerCase()}`],
+        (signer, operation) =>
+          executeSettle(signer, rawPayload, requirements, dataSuffix, operation),
+      );
     }
 
     return {
@@ -232,5 +270,168 @@ export class BatchSettlementEvmScheme implements SchemeNetworkFacilitator {
       transaction: "",
       network: requirements.network,
     };
+  }
+
+  /**
+   * Retains the existing handler's confirmation continuation for one admitted batch
+   * operation. A retry with identical wire input only waits on that transaction;
+   * changed terms on an unresolved channel/pair cannot sign or broadcast again.
+   * This is instance-local continuity, not a durable or cross-replica transaction service.
+   *
+   * @param payload - Original wire request.
+   * @param requirements - Accepted payment requirements.
+   * @param dataSuffix - Resolved transaction suffix.
+   * @param scopes - Channel and receiver-pair identities affected by the request.
+   * @param execute - Existing native batch handler.
+   * @returns Its confirmed response or an unresolved original effect.
+   */
+  private async runBatchOperation(
+    payload: PaymentPayload,
+    requirements: PaymentRequirements,
+    dataSuffix: `0x${string}` | undefined,
+    scopes: string[],
+    execute: (signer: FacilitatorEvmSigner, operation: BatchOperation) => Promise<SettleResponse>,
+  ): Promise<SettleResponse> {
+    unsignedEip155ChainId(requirements.network);
+    if (
+      payload.accepted.scheme !== requirements.scheme ||
+      payload.accepted.network !== requirements.network
+    ) {
+      return {
+        success: false,
+        errorReason: Errors.ErrNetworkMismatch,
+        transaction: "",
+        network: requirements.network,
+      };
+    }
+    const raw = payload.payload;
+    const configs = isBatchSettlementClaimPayload(raw)
+      ? raw.claims.map(claim => claim.voucher.channel)
+      : isBatchSettlementEnrichedRefundPayload(raw)
+        ? [raw.channelConfig]
+        : [];
+    if (
+      configs.some(config => config.receiver.toLowerCase() !== requirements.payTo.toLowerCase()) ||
+      (isBatchSettlementSettlePayload(raw) &&
+        raw.receiver.toLowerCase() !== requirements.payTo.toLowerCase())
+    ) {
+      return {
+        success: false,
+        errorReason: Errors.ErrReceiverMismatch,
+        transaction: "",
+        network: requirements.network,
+      };
+    }
+    if (
+      configs.some(config => config.token.toLowerCase() !== requirements.asset.toLowerCase()) ||
+      (isBatchSettlementSettlePayload(raw) &&
+        raw.token.toLowerCase() !== requirements.asset.toLowerCase())
+    ) {
+      return {
+        success: false,
+        errorReason: Errors.ErrTokenMismatch,
+        transaction: "",
+        network: requirements.network,
+      };
+    }
+    if (
+      isBatchSettlementEnrichedRefundPayload(raw) &&
+      computeChannelId(raw.channelConfig, requirements.network).toLowerCase() !==
+        raw.voucher.channelId.toLowerCase()
+    ) {
+      return {
+        success: false,
+        errorReason: Errors.ErrChannelIdMismatch,
+        transaction: "",
+        network: requirements.network,
+      };
+    }
+    const fingerprint = batchOperationFingerprint({ payload, requirements, dataSuffix });
+    const previous = scopes.map(scope => this.batchOperations.get(scope)).find(Boolean);
+    if (previous && previous.fingerprint !== fingerprint) {
+      return {
+        success: false,
+        errorReason: Errors.ErrChannelBusy,
+        errorMessage: "prior batch operation is unresolved; this changed request was not submitted",
+        transaction: "",
+        network: requirements.network,
+      };
+    }
+    const operation: BatchOperation = previous ?? {
+      fingerprint,
+      network: requirements.network,
+      broadcastStarted: false,
+    };
+    if (operation.flight) return operation.flight;
+    if (previous && !operation.confirm) {
+      return {
+        success: false,
+        errorReason: ErrSettlementPending,
+        errorMessage:
+          "prior broadcast outcome is unknown; no new signature or broadcast is permitted",
+        transaction: operation.transaction ?? "",
+        network: operation.network,
+      };
+    }
+    for (const scope of scopes) this.batchOperations.set(scope, operation);
+    const write: FacilitatorEvmSigner["writeContract"] = args => {
+      operation.broadcastStarted = true;
+      return this.signer.writeContract(args);
+    };
+    const wait: FacilitatorEvmSigner["waitForTransactionReceipt"] = async args => {
+      const receipt = await this.signer.waitForTransactionReceipt(args);
+      if (!receipt || (receipt.status !== "success" && receipt.status !== "reverted")) {
+        throw new Error("transaction receipt status is unknown");
+      }
+      const observedHash = (receipt as { transactionHash?: unknown }).transactionHash;
+      if (
+        observedHash !== undefined &&
+        (typeof observedHash !== "string" || observedHash.toLowerCase() !== args.hash.toLowerCase())
+      ) {
+        throw new Error("transaction receipt belongs to another hash");
+      }
+      return receipt;
+    };
+    // Bind original methods so prototype-backed signers keep their actual account state.
+    const signer = new Proxy(this.signer, {
+      get(target, key) {
+        if (key === "writeContract") return write;
+        if (key === "waitForTransactionReceipt") return wait;
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const flight = Promise.resolve().then(async () => {
+      const result = await execute(signer, operation);
+      const unknownBroadcast = operation.broadcastStarted && !operation.confirm;
+      if (unknownBroadcast) {
+        return {
+          success: false,
+          errorReason: ErrSettlementPending,
+          errorMessage: result.errorMessage ?? "broadcast returned no usable transaction hash",
+          transaction: operation.transaction ?? "",
+          network: operation.network,
+        };
+      }
+      if (result.errorReason !== ErrSettlementPending) {
+        for (const scope of scopes) {
+          if (this.batchOperations.get(scope) === operation) this.batchOperations.delete(scope);
+        }
+      }
+      return result;
+    });
+    operation.flight = flight;
+    try {
+      return await flight;
+    } catch (error) {
+      if (!operation.broadcastStarted) {
+        for (const scope of scopes) {
+          if (this.batchOperations.get(scope) === operation) this.batchOperations.delete(scope);
+        }
+      }
+      throw error;
+    } finally {
+      operation.flight = undefined;
+    }
   }
 }

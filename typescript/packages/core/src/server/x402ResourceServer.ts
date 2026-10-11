@@ -218,6 +218,28 @@ export type BeforeSettleHook = (
 
 export type AfterSettleHook = (context: SettleResultContext) => Promise<void>;
 
+/** Stable reason for an operation whose effect is known or still reserved, but not consumable. */
+export const SETTLEMENT_UNRESOLVED_REASON = "settlement_unresolved";
+
+/** Original network, hash, and optional binding to retry without signing a new payment. */
+export interface SettlementRetryIdentity {
+  network: string;
+  transaction: string;
+  binding?: string;
+}
+
+/**
+ * Operation-bound decision from a scheme that opts into settlement result acceptance.
+ * Void and `accepted` leave the facilitator result consumable. `unresolved` quarantines it.
+ */
+export type SettlementResultAcceptance =
+  | { outcome: "accepted" }
+  | {
+      outcome: "unresolved";
+      reason: string;
+      retry: SettlementRetryIdentity;
+    };
+
 export type OnSettleFailureHook = (
   context: SettleFailureContext,
 ) => Promise<void | { recovered: true; result: SettleResponse }>;
@@ -225,6 +247,53 @@ export type OnSettleFailureHook = (
 export type OnVerifiedPaymentCanceledHook = (
   context: VerifiedPaymentCanceledContext,
 ) => Promise<void>;
+
+/**
+ * Keeps a 32-byte transaction hash and drops any other assertion.
+ *
+ * @param transaction - Transaction field from a facilitator response
+ * @returns The original hash, or an empty string when it is not a confirmed hash
+ */
+function confirmedTransaction(transaction: string): string {
+  return /^0x[0-9a-fA-F]{64}$/.test(transaction) ? transaction : "";
+}
+
+/**
+ * Keeps the facilitator assertion distinct from the response an application may consume.
+ *
+ * @param asserted - Positive or skipped result that failed operation-bound acceptance
+ * @param acceptance - Unresolved decision and the original retry identity
+ * @returns A failed settle result that does not authorize another signature or broadcast
+ */
+function quarantineSettlementResult(
+  asserted: SettleResponse,
+  acceptance: Extract<SettlementResultAcceptance, { outcome: "unresolved" }>,
+): SettleResponse {
+  const transaction = confirmedTransaction(acceptance.retry.transaction);
+  return {
+    success: false,
+    errorReason: SETTLEMENT_UNRESOLVED_REASON,
+    errorMessage: acceptance.reason,
+    transaction,
+    network: acceptance.retry.network as Network,
+    payer: asserted.payer,
+    extra: {
+      settlementOutcome: "quarantined",
+      retryIdentity: {
+        network: acceptance.retry.network,
+        transaction,
+        ...(acceptance.retry.binding !== undefined ? { binding: acceptance.retry.binding } : {}),
+      },
+      facilitatorAssertion: {
+        success: asserted.success,
+        transaction: asserted.transaction,
+        amount: asserted.amount,
+        network: asserted.network,
+        payer: asserted.payer,
+      },
+    },
+  };
+}
 
 /**
  * Optional overrides for settlement parameters.
@@ -1257,30 +1326,15 @@ export class x402ResourceServer {
           });
         }
         if (result && "skip" in result && result.skip) {
-          const settleResult = result.result;
-          const skipResultContext: SettleResultContext = {
-            ...context,
-            result: settleResult,
-            transportContext,
-          };
-          for (const { label, hook } of this.getLabeledHooks(
-            "afterSettle",
+          return this.finishSkippedSettlement(
+            result.result,
+            context,
+            requirements,
             extensionKeysInUse,
             matchedScheme,
-          )) {
-            try {
-              await hook(skipResultContext);
-            } catch (error) {
-              this.warnResourceServerHookFailure("afterSettle", label, error);
-            }
-          }
-          await this.enrichSettlementResponse(
-            settleResult,
-            skipResultContext,
             resolvedDeclaredExtensions,
-            matchedScheme,
+            transportContext,
           );
-          return settleResult;
         }
       } catch (error) {
         if (error instanceof SettleError) {
@@ -1391,6 +1445,10 @@ export class x402ResourceServer {
         ...context,
         result: settleResult,
       };
+      const unresolved = await this.settlementResultAcceptance(requirements, resultContext);
+      if (unresolved) {
+        return unresolved;
+      }
 
       for (const { label, hook } of this.getLabeledHooks(
         "afterSettle",
@@ -1554,6 +1612,101 @@ export class x402ResourceServer {
           `Unsupported x402 version: ${(paymentPayload as PaymentPayload).x402Version}`,
         );
     }
+  }
+
+  /**
+   * Asks the registered scheme to accept a successful settle result before observers run.
+   * Schemes that omit the method, or that return void or `accepted`, leave the result unchanged.
+   * A throw is an unresolved quarantine, not a logged success and not a new payment requirement.
+   *
+   * @param requirements - Requirements that selected the scheme
+   * @param resultContext - Facilitator or skipped result bound to the original payload
+   * @returns Quarantined settle response, or undefined when the result stays consumable
+   */
+  private async settlementResultAcceptance(
+    requirements: PaymentRequirements,
+    resultContext: SettleResultContext,
+  ): Promise<SettleResponse | undefined> {
+    const scheme = findByNetworkAndScheme(
+      this.registeredServerSchemes,
+      requirements.scheme,
+      requirements.network as Network,
+    );
+    const accept = scheme?.acceptSettlementResult;
+    if (!accept) {
+      return undefined;
+    }
+
+    let acceptance: SettlementResultAcceptance | void;
+    try {
+      acceptance = await accept.call(scheme, resultContext);
+    } catch (error) {
+      acceptance = {
+        outcome: "unresolved",
+        reason: error instanceof Error ? error.message : String(error),
+        retry: {
+          network: requirements.network,
+          transaction: confirmedTransaction(resultContext.result.transaction),
+        },
+      };
+    }
+    if (!acceptance || acceptance.outcome !== "unresolved") {
+      return undefined;
+    }
+    return quarantineSettlementResult(resultContext.result, acceptance);
+  }
+
+  /**
+   * Finishes a beforeSettle skip after operation-bound acceptance.
+   * An unresolved refund returns the quarantine and does not run ordinary observers.
+   *
+   * @param settleResult - Result supplied by the skipping hook
+   * @param context - Settle context for that payload
+   * @param requirements - Requirements that selected the scheme
+   * @param extensionKeysInUse - Declared extension keys for observer selection
+   * @param matchedScheme - Scheme and network being settled
+   * @param matchedScheme.network - Network of the matched scheme
+   * @param matchedScheme.scheme - Scheme name
+   * @param resolvedDeclaredExtensions - Declared extension values
+   * @param transportContext - Transport context supplied to settle
+   * @returns The consumable result, or a quarantined result when acceptance refuses it
+   */
+  private async finishSkippedSettlement(
+    settleResult: SettleResponse,
+    context: SettleContext,
+    requirements: PaymentRequirements,
+    extensionKeysInUse: string[],
+    matchedScheme: { network: Network; scheme: string },
+    resolvedDeclaredExtensions: Record<string, unknown>,
+    transportContext: unknown,
+  ): Promise<SettleResponse> {
+    const skipResultContext: SettleResultContext = {
+      ...context,
+      result: settleResult,
+      transportContext,
+    };
+    const unresolvedSkip = await this.settlementResultAcceptance(requirements, skipResultContext);
+    if (unresolvedSkip) {
+      return unresolvedSkip;
+    }
+    for (const { label, hook } of this.getLabeledHooks(
+      "afterSettle",
+      extensionKeysInUse,
+      matchedScheme,
+    )) {
+      try {
+        await hook(skipResultContext);
+      } catch (error) {
+        this.warnResourceServerHookFailure("afterSettle", label, error);
+      }
+    }
+    await this.enrichSettlementResponse(
+      settleResult,
+      skipResultContext,
+      resolvedDeclaredExtensions,
+      matchedScheme,
+    );
+    return settleResult;
   }
 
   /**

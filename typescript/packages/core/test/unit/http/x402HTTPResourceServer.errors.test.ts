@@ -246,4 +246,45 @@ describe("x402HTTPResourceServer facilitator response errors", () => {
     expect(result.type).toBe("payment-error");
     expect(facilitator.verifyCalls).toHaveLength(0);
   });
+
+  it("returns 409 for an unresolved settlement without a new payment challenge", async () => {
+    const tx = `0x${"cd".repeat(32)}`;
+    facilitator.setSettleResponse(
+      buildSettleResponse({
+        success: false,
+        errorReason: "settlement_unresolved",
+        errorMessage: "response amount is not the admitted refund amount",
+        transaction: tx,
+        network,
+        extra: {
+          settlementOutcome: "quarantined",
+          retryIdentity: { network, transaction: tx },
+        },
+      }),
+    );
+    const accepted = buildPaymentRequirements({
+      scheme: "exact",
+      network,
+      payTo: "0xabc",
+      asset: "USDC",
+      amount: "1000000",
+    });
+    const result = await httpServer.processSettlement(
+      buildPaymentPayload({ x402Version: 2, accepted }),
+      accepted,
+    );
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.response.status).toBe(409);
+    expect(result.response.headers["PAYMENT-REQUIRED"]).toBeUndefined();
+    expect(result.response.headers["Cache-Control"]).toBe("private, no-store");
+    expect(result.response.body).toMatchObject({
+      settlementOutcome: "unresolved",
+      transaction: tx,
+      network,
+    });
+    const decoded = decodePaymentResponseHeader(result.headers["PAYMENT-RESPONSE"]);
+    expect(decoded.errorReason).toBe("settlement_unresolved");
+    expect(decoded.transaction).toBe(tx);
+  });
 });

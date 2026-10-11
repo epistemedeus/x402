@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import { computeChannelId } from "../utils";
 import type { BatchSettlementClientContext, ClientChannelStorage } from "./storage";
+import type { RefundAttempt } from "./refund";
 
 /**
  * Runtime dependency bag shared by every storage-bound client helper (channel,
@@ -22,6 +23,8 @@ export interface BatchSettlementClientDeps {
   salt: `0x${string}`;
   payerAuthorizer?: `0x${string}`;
   voucherSigner?: ClientEvmSigner;
+  /** Original HTTP refunds owned by this live client instance, never spending capacity. */
+  refundAttempts?: Map<string, RefundAttempt>;
 }
 
 /**

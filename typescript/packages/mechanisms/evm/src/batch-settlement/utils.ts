@@ -17,6 +17,27 @@ export function isCanonicalChannelId(value: unknown): value is `0x${string}` {
   return typeof value === "string" && CHANNEL_ID_RE.test(value);
 }
 
+/** Asserted transaction hash: `0x` and exactly 64 hex digits, either case. */
+const ASSERTED_TX_RE = /^0x[0-9a-fA-F]{64}$/;
+
+/**
+ * Reports whether two asserted hashes are the same 32-byte transaction.
+ * The stored spelling stays as first recorded. Comparison uses the lowercase form.
+ * A different hash, a short string, or non-hex text is a different identity.
+ *
+ * @param recorded - Hash already kept on the attempt, if any.
+ * @param observed - Hash named by the latest response.
+ * @returns `true` when both values are that same 32-byte hash.
+ */
+export function sameAssertedTransactionHash(
+  recorded: string | undefined,
+  observed: string | undefined,
+): boolean {
+  if (recorded === undefined || observed === undefined) return false;
+  if (!ASSERTED_TX_RE.test(recorded) || !ASSERTED_TX_RE.test(observed)) return false;
+  return recorded.toLowerCase() === observed.toLowerCase();
+}
+
 /**
  * Validates canonical `bytes32` form and normalizes to lowercase.
  *

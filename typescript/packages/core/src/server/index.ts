@@ -1,4 +1,4 @@
-export { x402ResourceServer } from "./x402ResourceServer";
+export { x402ResourceServer, SETTLEMENT_UNRESOLVED_REASON } from "./x402ResourceServer";
 export type {
   ResourceConfig,
   PaymentRequiredContext,
@@ -25,6 +25,8 @@ export type {
   AfterSettleHook,
   OnSettleFailureHook,
   OnVerifiedPaymentCanceledHook,
+  SettlementResultAcceptance,
+  SettlementRetryIdentity,
 } from "./x402ResourceServer";
 export {
   SDK_DEFAULT_ASSET_TRANSFER_METHOD,

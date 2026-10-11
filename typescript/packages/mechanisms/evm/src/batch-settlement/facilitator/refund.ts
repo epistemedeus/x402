@@ -15,10 +15,11 @@ import {
 import { computeChannelId } from "../utils";
 import { signClaimBatch, signRefund } from "../authorizerSigner";
 import * as Errors from "../errors";
-import { truncateErrorMessage } from "../../utils";
+import { isValidTxHash, truncateErrorMessage } from "../../utils";
 import { waitAndReturnSettleResponse } from "../../shared/settleReceipt";
 import { buildVoucherClaimArgs } from "./claim";
 import { readChannelState, toContractChannelConfig } from "./utils";
+import type { BatchOperation } from "./operation";
 
 type RefundSettlementExtra = {
   channelState: {
@@ -31,9 +32,45 @@ type RefundSettlementExtra = {
 };
 
 type RefundSettlementDetails = {
-  amount: string;
+  amount?: string;
   extra: RefundSettlementExtra;
 };
+
+/**
+ * Amount the server admitted for this refund, including a clamped partial request.
+ *
+ * @param payload - Refund payload, with `effectiveAmount` when the server clamped it
+ * @returns Decimal token amount that settlement and signing must use
+ */
+function admittedWireAmount(payload: BatchSettlementEnrichedRefundPayload): string {
+  const candidate = payload.effectiveAmount ?? payload.amount;
+  return /^\d+$/.test(candidate) ? candidate : payload.amount;
+}
+
+/**
+ * Highest post-claim total for the refunded channel. Other channels in the batch do not apply.
+ *
+ * @param claims - Bundled claims, in any order
+ * @param channelId - Channel whose refund amount is being computed
+ * @param network - Network used to derive each claim's channel id
+ * @param preTotalClaimed - Claimed total already recorded for this channel
+ * @returns Claimed total after this channel's own claims
+ */
+function scopedPostClaimTotal(
+  claims: BatchSettlementEnrichedRefundPayload["claims"],
+  channelId: `0x${string}`,
+  network: string,
+  preTotalClaimed: bigint,
+): bigint {
+  return claims.reduce((max, claim) => {
+    const claimChannelId = computeChannelId(claim.voucher.channel, network);
+    if (claimChannelId.toLowerCase() !== channelId.toLowerCase()) {
+      return max;
+    }
+    const totalClaimed = BigInt(claim.totalClaimed);
+    return totalClaimed > max ? totalClaimed : max;
+  }, preTotalClaimed);
+}
 
 /**
  * Computes the token amount that `refundWithSignature` would transfer after any
@@ -51,21 +88,18 @@ function getRefundableAmount(
   channelId: `0x${string}`,
   network: string,
 ): bigint | null {
-  const postClaimTotalClaimed = payload.claims.reduce((max, claim) => {
-    const claimChannelId = computeChannelId(claim.voucher.channel, network);
-    if (claimChannelId.toLowerCase() !== channelId.toLowerCase()) {
-      return max;
-    }
-
-    const totalClaimed = BigInt(claim.totalClaimed);
-    return totalClaimed > max ? totalClaimed : max;
-  }, preState.totalClaimed);
+  const postClaimTotalClaimed = scopedPostClaimTotal(
+    payload.claims,
+    channelId,
+    network,
+    preState.totalClaimed,
+  );
 
   if (postClaimTotalClaimed > preState.balance) {
     return null;
   }
 
-  const requestedAmount = BigInt(payload.amount);
+  const requestedAmount = BigInt(admittedWireAmount(payload));
   if (requestedAmount === 0n) {
     return null;
   }
@@ -80,24 +114,40 @@ function getRefundableAmount(
  * @param payload - Refund payload containing claims and amount.
  * @param channelId - Canonical channel id for the refund.
  * @param preState - Onchain channel state before this refund, or null if unknown.
+ * @param network - Network used to ignore claims for other channels.
  * @returns Actual refund amount and extra fields for the settlement response.
  */
 function buildRefundExtra(
   payload: BatchSettlementEnrichedRefundPayload,
   channelId: `0x${string}`,
   preState: ChannelState | null,
+  network: string,
 ): RefundSettlementDetails {
   const preTotalClaimed = preState?.totalClaimed ?? 0n;
   const preBalance = preState?.balance ?? 0n;
-
-  const lastClaimTotal =
-    payload.claims.length > 0
-      ? BigInt(payload.claims[payload.claims.length - 1].totalClaimed)
-      : preTotalClaimed;
-  const postClaimTotalClaimed = lastClaimTotal > preTotalClaimed ? lastClaimTotal : preTotalClaimed;
+  const postClaimTotalClaimed = scopedPostClaimTotal(
+    payload.claims,
+    channelId,
+    network,
+    preTotalClaimed,
+  );
+  const refundNonce = String((preState?.refundNonce ?? 0n) + 1n);
+  if (postClaimTotalClaimed > preBalance) {
+    return {
+      extra: {
+        channelState: {
+          channelId,
+          balance: preBalance.toString(),
+          totalClaimed: preTotalClaimed.toString(),
+          withdrawRequestedAt: 0,
+          refundNonce,
+        },
+      },
+    };
+  }
 
   const available = preBalance - postClaimTotalClaimed;
-  const requestedAmount = BigInt(payload.amount);
+  const requestedAmount = BigInt(admittedWireAmount(payload));
   const actualRefund = requestedAmount > available ? available : requestedAmount;
 
   return {
@@ -108,7 +158,7 @@ function buildRefundExtra(
         balance: (preBalance - actualRefund).toString(),
         totalClaimed: postClaimTotalClaimed.toString(),
         withdrawRequestedAt: 0,
-        refundNonce: String((preState?.refundNonce ?? 0n) + 1n),
+        refundNonce,
       },
     },
   };
@@ -193,6 +243,7 @@ function buildRefundExtraFromPostState(
  * @param authorizerSigner - Optional dedicated key for producing EIP-712 signatures.
  *   When omitted, the payload must already carry the required authorizer signatures.
  * @param dataSuffix - Optional hex suffix appended to the refund transaction.
+ * @param operation - Instance-owned continuation for exact pending retries.
  * @returns A {@link SettleResponse} with the transaction hash on success.
  */
 export async function executeRefundWithSignature(
@@ -201,8 +252,12 @@ export async function executeRefundWithSignature(
   requirements: PaymentRequirements,
   authorizerSigner: AuthorizerSigner | undefined,
   dataSuffix?: `0x${string}`,
+  operation?: BatchOperation,
 ): Promise<SettleResponse> {
+  if (operation?.confirm) return operation.confirm();
+  payload = structuredClone(payload);
   const network = requirements.network;
+  const signedAmount = admittedWireAmount(payload);
 
   try {
     const channelId = computeChannelId(payload.channelConfig, network);
@@ -246,20 +301,14 @@ export async function executeRefundWithSignature(
 
     const refundSig =
       payload.refundAuthorizerSignature ??
-      (await signRefund(
-        authorizerSigner!,
-        channelId,
-        payload.amount,
-        payload.refundNonce,
-        network,
-      ));
+      (await signRefund(authorizerSigner!, channelId, signedAmount, payload.refundNonce, network));
 
     const refundCalldata = encodeFunctionData({
       abi: batchSettlementABI,
       functionName: "refundWithSignature",
       args: [
         toContractChannelConfig(payload.channelConfig),
-        BigInt(payload.amount),
+        BigInt(signedAmount),
         BigInt(payload.refundNonce),
         refundSig,
       ],
@@ -319,7 +368,7 @@ export async function executeRefundWithSignature(
           functionName: "refundWithSignature",
           args: [
             toContractChannelConfig(payload.channelConfig),
-            BigInt(payload.amount),
+            BigInt(signedAmount),
             BigInt(payload.refundNonce),
             refundSig,
           ],
@@ -340,7 +389,7 @@ export async function executeRefundWithSignature(
         functionName: "refundWithSignature",
         args: [
           toContractChannelConfig(payload.channelConfig),
-          BigInt(payload.amount),
+          BigInt(signedAmount),
           BigInt(payload.refundNonce),
           refundSig,
         ],
@@ -348,28 +397,34 @@ export async function executeRefundWithSignature(
       });
     }
 
-    return await waitAndReturnSettleResponse(signer, tx, network, payload.channelConfig.payer, {
-      failedStatusReason: Errors.ErrRefundTransactionFailed,
-      onSuccess: async () => {
-        const postState =
-          preState && preState.withdrawRequestedAt !== 0
-            ? await readPostRefundState(signer, channelId, payload.refundNonce)
-            : null;
-        const refundDetails =
-          preState && postState
-            ? buildRefundExtraFromPostState(channelId, preState, postState)
-            : buildRefundExtra(payload, channelId, preState);
+    const confirm = () =>
+      waitAndReturnSettleResponse(signer, tx, network, payload.channelConfig.payer, {
+        failedStatusReason: Errors.ErrRefundTransactionFailed,
+        onSuccess: async () => {
+          const postState =
+            preState && preState.withdrawRequestedAt !== 0
+              ? await readPostRefundState(signer, channelId, payload.refundNonce)
+              : null;
+          const refundDetails =
+            preState && postState
+              ? buildRefundExtraFromPostState(channelId, preState, postState)
+              : buildRefundExtra(payload, channelId, preState, network);
 
-        return {
-          success: true,
-          transaction: tx,
-          network,
-          payer: payload.channelConfig.payer,
-          amount: refundDetails.amount,
-          extra: refundDetails.extra,
-        };
-      },
-    });
+          return {
+            success: true,
+            transaction: tx,
+            network,
+            payer: payload.channelConfig.payer,
+            ...(refundDetails.amount !== undefined ? { amount: refundDetails.amount } : {}),
+            extra: refundDetails.extra,
+          };
+        },
+      });
+    if (operation && isValidTxHash(tx)) {
+      operation.transaction = tx;
+      operation.confirm = confirm;
+    }
+    return await confirm();
   } catch (e) {
     return {
       success: false,
