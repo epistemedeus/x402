@@ -6,9 +6,10 @@ import { batchSettlementABI } from "../abi";
 import { BATCH_SETTLEMENT_ADDRESS } from "../constants";
 import { signClaimBatch } from "../authorizerSigner";
 import * as Errors from "../errors";
-import { truncateErrorMessage } from "../../utils";
+import { isValidTxHash, truncateErrorMessage } from "../../utils";
 import { waitAndReturnSettleResponse } from "../../shared/settleReceipt";
 import { toContractChannelConfig } from "./utils";
+import type { BatchOperation } from "./operation";
 
 /**
  * Converts an array of {@link BatchSettlementVoucherClaim} into the onchain tuple format
@@ -42,6 +43,7 @@ export function buildVoucherClaimArgs(claims: BatchSettlementClaimPayload["claim
  * @param authorizerSigner - Optional dedicated key for producing `ClaimBatch` EIP-712 signatures.
  *   When omitted, the payload must already carry a `claimAuthorizerSignature`.
  * @param dataSuffix - Optional hex suffix appended to the claim transaction.
+ * @param operation - Instance-owned continuation for exact pending retries.
  * @returns A {@link SettleResponse} with the transaction hash on success.
  */
 export async function executeClaimWithSignature(
@@ -50,7 +52,9 @@ export async function executeClaimWithSignature(
   requirements: PaymentRequirements,
   authorizerSigner: AuthorizerSigner | undefined,
   dataSuffix?: `0x${string}`,
+  operation?: BatchOperation,
 ): Promise<SettleResponse> {
+  if (operation?.confirm) return operation.confirm();
   const network = requirements.network;
   const claimArgs = buildVoucherClaimArgs(payload.claims);
 
@@ -107,9 +111,15 @@ export async function executeClaimWithSignature(
       dataSuffix,
     });
 
-    return await waitAndReturnSettleResponse(signer, tx, network, undefined, {
-      failedStatusReason: Errors.ErrClaimTransactionFailed,
-    });
+    const confirm = () =>
+      waitAndReturnSettleResponse(signer, tx, network, undefined, {
+        failedStatusReason: Errors.ErrClaimTransactionFailed,
+      });
+    if (operation && isValidTxHash(tx)) {
+      operation.transaction = tx;
+      operation.confirm = confirm;
+    }
+    return await confirm();
   } catch (e) {
     return {
       success: false,

@@ -5,6 +5,12 @@ export { ErrDepositBelowMinDeposit } from "../errors";
 export { InMemoryChannelStorage } from "./storage";
 export type { Channel, ChannelStorage, ChannelUpdateResult, PendingRequest } from "./storage";
 export { BatchSettlementChannelManager } from "./channelManager";
+export { readBatchSettlementReceiverState } from "./receiverState";
+export type {
+  ReadReceiverSettlement,
+  ReceiverSettlementScope,
+  ReceiverSettlementSnapshot,
+} from "./receiverState";
 export type {
   ChannelManagerConfig,
   AutoSettlementConfig,

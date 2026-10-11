@@ -5,12 +5,21 @@ import type {
   SettleResponse,
 } from "@x402/core/types";
 import type { FacilitatorClient } from "@x402/core/server";
+import { getAddress } from "viem";
 import type { BatchSettlementVoucherClaim } from "../types";
 import type { BatchSettlementEvmScheme } from "./scheme";
 import { computeChannelId } from "../utils";
 import { BATCH_SETTLEMENT_SCHEME } from "../constants";
+import { ErrNothingToSettle } from "../errors";
 import { signClaimBatch, signRefund } from "../authorizerSigner";
-import type { Channel } from "./storage";
+import { isChannelAdmissionLive, type Channel } from "./storage";
+import { refundEffectMismatch } from "./settle";
+import {
+  assertReceiverSettlementTotals,
+  unsignedEip155ChainId,
+  type ReadReceiverSettlement,
+  type ReceiverSettlementSnapshot,
+} from "./receiverState";
 
 export interface ChannelManagerConfig {
   scheme: BatchSettlementEvmScheme;
@@ -18,6 +27,12 @@ export interface ChannelManagerConfig {
   receiver: `0x${string}`;
   token: `0x${string}`;
   network: Network;
+  /**
+   * Reads `receivers(payTo, token)` for this manager's network.
+   * Required to settle a refund whose claim was submitted outside this process.
+   * Absent readers keep the process-local hint and cannot see those claims.
+   */
+  readReceiverSettlement?: ReadReceiverSettlement;
 }
 
 export type ClaimChannelSelector = (
@@ -52,6 +67,14 @@ export interface AutoSettlementContext {
   now: number;
   lastClaimTime: number;
   lastSettleTime: number;
+  /**
+   * Whether this manager's network, token, and payTo still need `settle`.
+   * Claim, refund, and settle hooks in one pass receive this same meaning.
+   * With a reader it is that pass's validated chain observation
+   * (`totalClaimed > totalSettled`). An invalid observation throws to the
+   * caller or `onError` and the hook is not called. Without a reader it is
+   * only the process-local hint. It is not a boolean cached from an earlier pass.
+   */
   pendingSettle: boolean;
 }
 
@@ -60,9 +83,27 @@ export interface ClaimResult {
   transaction: string;
 }
 
-export interface SettleResult {
-  transaction: string;
-}
+/**
+ * Result of one `settle` attempt for this manager's scope.
+ * `settled` carries the facilitator transaction string.
+ * `already-settled` is a verified noop: this scope was already equal, or a
+ * fresh read showed that after nothing-to-settle. A noop has no transaction
+ * and no amount.
+ */
+export type SettleResult =
+  | {
+      outcome: "settled";
+      /**
+       * Facilitator-reported transaction string.
+       * With a reader, this pair's settled total also moved by at least the
+       * reported amount. That movement does not attribute this hash.
+       */
+      transaction: string;
+    }
+  | {
+      outcome: "already-settled";
+      transaction?: never;
+    };
 
 export interface RefundResult {
   channel: string;
@@ -92,7 +133,7 @@ function formatFacilitatorFailure(operation: string, response: SettleResponse): 
  * @returns Whether the channel is busy with a live pending request.
  */
 function hasLivePendingRequest(channel: Channel, now = Date.now()): boolean {
-  return channel.pendingRequest !== undefined && channel.pendingRequest.expiresAt > now;
+  return isChannelAdmissionLive(channel.pendingRequest, now);
 }
 
 /**
@@ -113,10 +154,29 @@ export class BatchSettlementChannelManager {
   private lastClaimTime = 0;
   private lastSettleTime = 0;
   private pendingSettle = false;
+  private readonly admittedOperations = new Set<Promise<unknown>>();
+  private activeClaimRefunds = 0;
+  private claimFlight: { options: ClaimOptions; flight: Promise<ClaimResult[]> } | null = null;
+  private readonly refundFlights = new Map<
+    string,
+    { binding: string; flight: Promise<RefundResult> }
+  >();
+  private unresolvedEffect: Error | null = null;
+  /** Increments at claim/refund-with-claims admission, before an effect can become unknown. */
+  private settleObligation = 0;
   private running = false;
+  private stopping = false;
+  private stopUsers = 0;
   private pendingJobs = new Set<AutoJob>();
-  private drainingJobs = false;
   private autoSettleConfig: AutoSettlementConfig = {};
+  private readonly readReceiverSettlement: ReadReceiverSettlement | undefined;
+  private settlementFlight: Promise<SettleResult> | null = null;
+  private drainFlight: Promise<void> | null = null;
+  private stopFlight: Promise<void> | null = null;
+  private outsideStopWaiters = 0;
+  private callbackDepth = 0;
+  private flushRequested = false;
+  private reentrantStops: Array<() => void> = [];
 
   /**
    * Creates a new channel manager.
@@ -129,6 +189,7 @@ export class BatchSettlementChannelManager {
     this.receiver = config.receiver;
     this.token = config.token;
     this.network = config.network;
+    this.readReceiverSettlement = config.readReceiverSettlement;
   }
 
   /**
@@ -141,29 +202,16 @@ export class BatchSettlementChannelManager {
    * @returns Array of claim results (one per batch).
    */
   async claim(opts?: ClaimOptions): Promise<ClaimResult[]> {
-    const channels = await this.selectClaimTargets(opts);
-    return this.claimFromChannels(channels, {
-      maxClaimsPerBatch: opts?.maxClaimsPerBatch ?? 100,
-      ...(opts?.idleSecs !== undefined ? { idleSecs: opts.idleSecs } : {}),
-    });
+    return this.admitOperation(() => this.claimNow(opts));
   }
 
   /**
    * Transfers claimed (but unsettled) funds to the receiver by calling `settle(receiver, token)`.
    *
-   * @returns Settle result with the transaction hash.
+   * @returns Facilitator-reported transaction string after this manager's settle checks.
    */
   async settle(): Promise<SettleResult> {
-    const paymentPayload = this.buildSettlePaymentPayload();
-    const requirements = this.buildPaymentRequirements();
-
-    const response = await this.facilitator.settle(paymentPayload, requirements);
-    if (!response.success) {
-      throw new Error(formatFacilitatorFailure("Settle", response));
-    }
-
-    this.pendingSettle = false;
-    return { transaction: response.transaction };
+    return this.admitOperation(() => this.settleNow());
   }
 
   /**
@@ -178,12 +226,7 @@ export class BatchSettlementChannelManager {
   async claimAndSettle(
     opts?: ClaimOptions,
   ): Promise<{ claims: ClaimResult[]; settle?: SettleResult }> {
-    const claims = await this.claim(opts);
-    let settleResult: SettleResult | undefined;
-    if (claims.length > 0) {
-      settleResult = await this.settle();
-    }
-    return { claims, settle: settleResult };
+    return this.admitOperation(() => this.claimAndSettleNow(opts));
   }
 
   /**
@@ -193,23 +236,7 @@ export class BatchSettlementChannelManager {
    * @returns One result per successfully refunded channel.
    */
   async refund(channelIds?: string[]): Promise<RefundResult[]> {
-    const storage = this.scheme.getStorage();
-    const channels = await storage.list();
-
-    const now = Date.now();
-    const targets = (
-      channelIds
-        ? channels.filter(s =>
-            channelIds.some(id => id.toLowerCase() === s.channelId.toLowerCase()),
-          )
-        : channels
-    ).filter(channel => !hasLivePendingRequest(channel, now));
-
-    if (targets.length === 0) {
-      return [];
-    }
-
-    return this.refundChannels(targets);
+    return this.admitOperation(() => this.refundNow(channelIds));
   }
 
   /**
@@ -220,8 +247,10 @@ export class BatchSettlementChannelManager {
    * @returns One result per successfully refunded channel.
    */
   async refundIdleChannels(opts: { idleSecs: number }): Promise<RefundResult[]> {
-    const channels = await this.getIdleChannelsForRefund(opts.idleSecs);
-    return this.refundChannels(channels);
+    return this.admitOperation(async () => {
+      const channels = await this.getIdleChannelsForRefund(opts.idleSecs);
+      return this.refundChannels(channels);
+    });
   }
 
   /**
@@ -237,7 +266,10 @@ export class BatchSettlementChannelManager {
    */
   async getClaimableVouchers(opts?: { idleSecs?: number }): Promise<BatchSettlementVoucherClaim[]> {
     const channels = await this.scheme.getStorage().list();
-    return this.getClaimableVouchersFromChannels(channels, opts);
+    return this.getClaimableVouchersFromChannels(
+      channels.filter(channel => this.managesChannel(channel)),
+      opts,
+    );
   }
 
   /**
@@ -247,7 +279,7 @@ export class BatchSettlementChannelManager {
    */
   async getWithdrawalPendingSessions(): Promise<Channel[]> {
     const channels = await this.scheme.getStorage().list();
-    return channels.filter(s => s.withdrawRequestedAt > 0);
+    return channels.filter(s => this.managesChannel(s) && s.withdrawRequestedAt > 0);
   }
 
   /**
@@ -256,7 +288,7 @@ export class BatchSettlementChannelManager {
    * @param config - Auto-settlement policy configuration.
    */
   start(config: AutoSettlementConfig = {}): void {
-    if (this.running) {
+    if (this.running || this.stopping) {
       return;
     }
 
@@ -274,24 +306,161 @@ export class BatchSettlementChannelManager {
   /**
    * Stops the auto-settlement loop.
    *
+   * Disables new admission and drops jobs that have not started. An admitted
+   * job already in flight is awaited, then `flush` runs one claim-and-settle.
+   * Concurrent stops share that shutdown. A stop called from a claim, settle,
+   * refund, or error hook does not wait on the job that invoked the hook, so
+   * the hook can await `stop` without deadlocking the drain. `start()` works
+   * again after this promise resolves.
+   *
    * @param opts - Stop options.
-   * @param opts.flush - When true, run `claimAndSettle` before stopping.
-   * @returns Resolves when the loop is stopped (and flush work completes, if requested).
+   * @param opts.flush - When true, run one `claimAndSettle` after admitted work.
+   * @returns Resolves when admitted work and the optional flush have finished.
    */
   async stop(opts?: { flush?: boolean }): Promise<void> {
-    this.running = false;
-    for (const timer of Object.values(this.timers)) {
-      clearInterval(timer);
-    }
-    this.timers = {};
-    this.pendingJobs.clear();
-
     if (opts?.flush) {
-      await this.claimAndSettle({
-        maxClaimsPerBatch: this.autoSettleConfig.maxClaimsPerBatch,
-        selectClaimChannels: this.autoSettleConfig.selectClaimChannels,
-      });
+      this.flushRequested = true;
     }
+    this.stopUsers += 1;
+    this.stopping = true;
+    try {
+      if (this.callbackDepth > 0) {
+        this.disarmLoop();
+        if (this.drainFlight) {
+          await new Promise<void>(resolve => {
+            this.reentrantStops.push(resolve);
+          });
+        } else {
+          await this.flushIfRequested();
+        }
+        return;
+      }
+
+      if (this.stopFlight) {
+        await this.stopFlight;
+        return;
+      }
+
+      const flight = this.finishStop();
+      this.stopFlight = flight;
+      try {
+        await flight;
+      } finally {
+        if (this.stopFlight === flight) {
+          this.stopFlight = null;
+        }
+      }
+    } finally {
+      this.stopUsers -= 1;
+      if (this.stopUsers === 0) {
+        this.stopping = false;
+      }
+    }
+  }
+
+  /**
+   * Runs an already admitted claim, including shutdown's final flush.
+   *
+   * @param opts - Claim selection and batching policy.
+   * @returns Confirmed provider claim results.
+   */
+  private async claimNow(opts?: ClaimOptions): Promise<ClaimResult[]> {
+    this.assertResolvedEffect();
+    const options: ClaimOptions = { ...opts, maxClaimsPerBatch: opts?.maxClaimsPerBatch ?? 100 };
+    if (this.claimFlight) {
+      const previous = this.claimFlight.options;
+      if (
+        previous.maxClaimsPerBatch !== options.maxClaimsPerBatch ||
+        previous.idleSecs !== options.idleSecs ||
+        previous.selectClaimChannels !== options.selectClaimChannels
+      ) {
+        throw new Error("claim already admitted with a different selection or batching policy");
+      }
+      return this.claimFlight.flight;
+    }
+
+    const flight = Promise.resolve().then(async () => {
+      const channels = await this.selectClaimTargets(options);
+      return this.claimFromChannels(channels, {
+        maxClaimsPerBatch: options.maxClaimsPerBatch!,
+        ...(options.idleSecs !== undefined ? { idleSecs: options.idleSecs } : {}),
+      });
+    });
+    const admitted = { options, flight };
+    this.claimFlight = admitted;
+    try {
+      return await flight;
+    } finally {
+      if (this.claimFlight === admitted) this.claimFlight = null;
+    }
+  }
+
+  /**
+   * Shares one settlement among already admitted callers.
+   *
+   * @returns A transfer assertion or independently observed noop.
+   */
+  private async settleNow(): Promise<SettleResult> {
+    this.assertResolvedEffect();
+    if (this.settlementFlight) {
+      return this.settlementFlight;
+    }
+
+    const flight = this.submitSettle();
+    this.settlementFlight = flight;
+    try {
+      return await flight;
+    } finally {
+      if (this.settlementFlight === flight) {
+        this.settlementFlight = null;
+      }
+    }
+  }
+
+  /**
+   * Finishes one admitted claim-and-settle without reopening shutdown admission.
+   *
+   * @param opts - Claim selection and batching policy.
+   * @returns The claim results and optional settlement.
+   */
+  private async claimAndSettleNow(
+    opts?: ClaimOptions,
+  ): Promise<{ claims: ClaimResult[]; settle?: SettleResult }> {
+    this.assertResolvedEffect();
+    const claims = await this.claimNow(opts);
+    let settleResult: SettleResult | undefined;
+    if (claims.length > 0) {
+      settleResult = await this.settleNow();
+    } else if (await this.observedPending()) {
+      settleResult = await this.settleNow();
+    }
+    return { claims, settle: settleResult };
+  }
+
+  /**
+   * Selects scoped refundable rows for an already admitted call.
+   *
+   * @param channelIds - Optional subset of stored channel ids.
+   * @returns Confirmed provider refund results.
+   */
+  private async refundNow(channelIds?: string[]): Promise<RefundResult[]> {
+    const storage = this.scheme.getStorage();
+    const channels = (await storage.list()).filter(channel => this.managesChannel(channel));
+
+    const now = Date.now();
+    const targets = (
+      channelIds
+        ? channels.filter(s =>
+            channelIds.some(id => id.toLowerCase() === s.channelId.toLowerCase()),
+          )
+        : channels
+    ).filter(channel => this.canRefundChannel(channel, now));
+
+    if (targets.length === 0) {
+      return [];
+    }
+
+    return this.refundChannels(targets);
   }
 
   /**
@@ -301,62 +470,133 @@ export class BatchSettlementChannelManager {
    * @returns Successful refund transaction.
    */
   private async refundChannel(target: Channel): Promise<RefundResult> {
-    const authorizerSigner = this.scheme.getReceiverAuthorizerSigner();
-    const claims = this.buildRefundClaims(target);
-
-    const refundAmount = (
-      BigInt(target.balance) - BigInt(target.chargedCumulativeAmount)
-    ).toString();
-
-    const nonce = String(target.refundNonce ?? 0);
-
-    const refundAuthorizerSignature = authorizerSigner
-      ? await signRefund(
-          authorizerSigner,
-          target.channelId as `0x${string}`,
-          refundAmount,
-          nonce,
-          this.network,
-        )
-      : undefined;
-
-    const claimAuthorizerSignature =
-      authorizerSigner && claims.length > 0
-        ? await signClaimBatch(authorizerSigner, claims, this.network)
-        : undefined;
-
-    const paymentPayload: PaymentPayload = {
-      x402Version: 2,
-      accepted: this.buildPaymentRequirements(),
-      payload: {
-        type: "refund",
-        channelConfig: target.channelConfig,
-        voucher: {
-          channelId: target.channelId as `0x${string}`,
-          maxClaimableAmount: target.signedMaxClaimable,
-          signature: target.signature as `0x${string}`,
-        },
-        amount: refundAmount,
-        refundNonce: nonce,
-        claims,
-        ...(refundAuthorizerSignature ? { refundAuthorizerSignature } : {}),
-        ...(claimAuthorizerSignature ? { claimAuthorizerSignature } : {}),
-      },
-    };
-
-    const response = await this.facilitator.settle(paymentPayload, this.buildPaymentRequirements());
-    if (!response.success) {
-      throw new Error(formatFacilitatorFailure("Refund", response));
+    this.assertResolvedEffect();
+    unsignedEip155ChainId(this.network);
+    target = structuredClone(target);
+    const key = target.channelId.toLowerCase();
+    const binding = JSON.stringify([
+      key,
+      target.balance,
+      target.totalClaimed,
+      target.chargedCumulativeAmount,
+      target.signedMaxClaimable,
+      target.signature,
+      target.refundNonce ?? 0,
+    ]);
+    const previous = this.refundFlights.get(key);
+    if (previous) {
+      if (previous.binding !== binding) {
+        throw new Error("refund already admitted with different channel amounts or terms");
+      }
+      return previous.flight;
     }
 
-    await this.scheme
-      .getStorage()
-      .updateChannel(target.channelId, current =>
-        current && !hasLivePendingRequest(current) ? undefined : current,
+    const flight = Promise.resolve().then(() => this.submitRefund(target, binding));
+    const admitted = { binding, flight };
+    this.refundFlights.set(key, admitted);
+    this.activeClaimRefunds += 1;
+    try {
+      return await flight;
+    } finally {
+      this.activeClaimRefunds -= 1;
+      if (this.refundFlights.get(key) === admitted) this.refundFlights.delete(key);
+    }
+  }
+
+  /**
+   * Builds and submits the admitted refund snapshot.
+   *
+   * @param target - Original channel row and terms.
+   * @param binding - Economics frozen before this refund was signed or sent.
+   * @returns A confirmed provider refund result.
+   */
+  private async submitRefund(target: Channel, binding: string): Promise<RefundResult> {
+    const admission = await this.scheme.reserveManagerRefund(target, binding);
+    const authorizerSigner = this.scheme.getReceiverAuthorizerSigner();
+    const claims = this.buildRefundClaims(admission.channel);
+    const refundAmount = admission.effectiveAmount;
+    const nonce = String(admission.channel.refundNonce ?? 0);
+
+    let paymentPayload: PaymentPayload;
+    try {
+      const refundAuthorizerSignature = authorizerSigner
+        ? await signRefund(
+            authorizerSigner,
+            admission.channel.channelId as `0x${string}`,
+            refundAmount,
+            nonce,
+            this.network,
+          )
+        : undefined;
+      const claimAuthorizerSignature =
+        authorizerSigner && claims.length > 0
+          ? await signClaimBatch(authorizerSigner, claims, this.network)
+          : undefined;
+      paymentPayload = {
+        x402Version: 2,
+        accepted: this.buildPaymentRequirements(),
+        payload: {
+          type: "refund",
+          channelConfig: admission.channel.channelConfig,
+          voucher: {
+            channelId: admission.channel.channelId as `0x${string}`,
+            maxClaimableAmount: admission.channel.signedMaxClaimable,
+            signature: admission.channel.signature as `0x${string}`,
+          },
+          amount: refundAmount,
+          refundNonce: nonce,
+          claims,
+          ...(refundAuthorizerSignature ? { refundAuthorizerSignature } : {}),
+          ...(claimAuthorizerSignature ? { claimAuthorizerSignature } : {}),
+        },
+      };
+    } catch (error) {
+      await this.scheme.concludeManagerRefund(admission, "release");
+      throw error;
+    }
+
+    if (claims.length > 0) this.noteFreshObligation();
+    let response: SettleResponse;
+    try {
+      response = await this.sendOperation("Refund", paymentPayload);
+    } catch (error) {
+      await this.scheme.concludeManagerRefund(admission, "unknown");
+      throw error;
+    }
+    if (!response.success) {
+      if (response.transaction === "" && response.errorReason !== "settlement_pending") {
+        await this.scheme.concludeManagerRefund(admission, "release");
+        throw new Error(formatFacilitatorFailure("Refund", response));
+      }
+      await this.scheme.concludeManagerRefund(admission, "unknown", response);
+      throw this.rememberUnknown(
+        "Refund",
+        response.errorMessage || response.errorReason || "facilitator refusal was not final",
       );
+    }
+    const mismatch = refundEffectMismatch(response, {
+      network: this.network,
+      effectiveAmount: admission.effectiveAmount,
+      payer: admission.channel.channelConfig.payer,
+      channelId: admission.channel.channelId,
+      originalNonce: String(admission.channel.refundNonce ?? 0),
+      previousBalance: admission.channel.balance,
+    });
+    if (mismatch) {
+      await this.scheme.concludeManagerRefund(admission, "unknown", response);
+      throw this.rememberUnknown("Refund", mismatch);
+    }
+    try {
+      await this.scheme.concludeManagerRefund(admission, "reconcile", response);
+    } catch (error) {
+      await this.scheme
+        .concludeManagerRefund(admission, "unknown", response)
+        .catch(() => undefined);
+      throw error;
+    }
 
     return {
-      channel: target.channelId,
+      channel: admission.channel.channelId,
       transaction: response.transaction,
     };
   }
@@ -388,20 +628,33 @@ export class BatchSettlementChannelManager {
     }
 
     this.pendingJobs.add(job);
-    if (!this.drainingJobs) {
-      void this.drainJobs();
+    this.ensureDraining();
+  }
+
+  /**
+   * Starts the single drain flight for already queued jobs.
+   */
+  private ensureDraining(): void {
+    if (this.drainFlight) {
+      return;
     }
+
+    const flight = this.runDrain();
+    this.drainFlight = flight;
+    const clear = () => {
+      if (this.drainFlight === flight) this.drainFlight = null;
+    };
+    void flight.then(clear, clear);
   }
 
   /**
    * Drains queued auto jobs in priority order.
+   * A flush requested from inside a hook runs here, after the hook's job
+   * returns, and only when no external `stop` is already waiting to flush.
+   *
+   * @returns Resolves when the admitted queue and any hook flush have finished.
    */
-  private async drainJobs(): Promise<void> {
-    if (this.drainingJobs) {
-      return;
-    }
-
-    this.drainingJobs = true;
+  private async runDrain(): Promise<void> {
     try {
       while (this.running && this.pendingJobs.size > 0) {
         const job = this.nextPendingJob();
@@ -412,7 +665,136 @@ export class BatchSettlementChannelManager {
         await this.runAutoJob(job);
       }
     } finally {
-      this.drainingJobs = false;
+      await this.flushAfterDrain();
+    }
+  }
+
+  /**
+   * Runs a hook-requested flush when no external stop is waiting for this drain.
+   * Failures are reported through `onError` so an un-awaited hook stop does not
+   * become an unhandled rejection. Reentrant stop promises resolve afterward.
+   */
+  private async flushAfterDrain(): Promise<void> {
+    if (this.outsideStopWaiters > 0) {
+      return;
+    }
+
+    try {
+      if (this.flushRequested) {
+        this.flushRequested = false;
+        await this.performFlush();
+      }
+    } catch (error) {
+      this.reportError(error);
+    } finally {
+      this.resolveReentrantStops();
+    }
+  }
+
+  /**
+   * Disables timers and drops jobs that have not started.
+   * The job already removed from the queue keeps running.
+   */
+  private disarmLoop(): void {
+    this.running = false;
+    for (const timer of Object.values(this.timers)) {
+      clearInterval(timer);
+    }
+    this.timers = {};
+    this.pendingJobs.clear();
+  }
+
+  /**
+   * Awaits the admitted drain, then runs at most the flush requested by this shutdown.
+   *
+   * @returns Resolves when that shutdown work finishes.
+   */
+  private async finishStop(): Promise<void> {
+    this.disarmLoop();
+    this.outsideStopWaiters += 1;
+    try {
+      const inFlight = this.drainFlight;
+      if (inFlight) {
+        await inFlight;
+      }
+      while (this.admittedOperations.size > 0) {
+        await Promise.allSettled([...this.admittedOperations]);
+      }
+      await this.flushIfRequested();
+    } finally {
+      this.outsideStopWaiters -= 1;
+      this.resolveReentrantStops();
+    }
+  }
+
+  /**
+   * Runs one claim-and-settle when a stop asked for a flush.
+   *
+   * @returns Resolves when that flush finishes.
+   */
+  private async flushIfRequested(): Promise<void> {
+    if (!this.flushRequested) {
+      return;
+    }
+    this.flushRequested = false;
+    await this.performFlush();
+  }
+
+  /**
+   * Claims and settles once with the config captured by the last `start`.
+   *
+   * @returns The claim and settle results for this flush.
+   */
+  private performFlush(): Promise<{ claims: ClaimResult[]; settle?: SettleResult }> {
+    return this.claimAndSettleNow({
+      maxClaimsPerBatch: this.autoSettleConfig.maxClaimsPerBatch,
+      selectClaimChannels: this.autoSettleConfig.selectClaimChannels,
+    });
+  }
+
+  /**
+   * Releases hook-initiated `stop` calls that are waiting for the drain to leave their job.
+   */
+  private resolveReentrantStops(): void {
+    const waiters = this.reentrantStops.splice(0);
+    for (const resolve of waiters) {
+      resolve();
+    }
+  }
+
+  /**
+   * Invokes a hook without awaiting it, and marks the synchronous call as reentrant.
+   *
+   * @param hook - Optional listener.
+   * @param value - Value passed to the listener.
+   */
+  private emitHook<T>(hook: ((value: T) => void) | undefined, value: T): void {
+    if (!hook) {
+      return;
+    }
+    this.callbackDepth += 1;
+    try {
+      hook(value);
+    } finally {
+      this.callbackDepth -= 1;
+    }
+  }
+
+  /**
+   * Reports an auto-job or hook-flush failure without presenting it as a boolean.
+   *
+   * @param error - Failure from a job, a scope read, or a hook flush.
+   */
+  private reportError(error: unknown): void {
+    const hook = this.autoSettleConfig.onError;
+    if (!hook) {
+      return;
+    }
+    this.callbackDepth += 1;
+    try {
+      hook(error);
+    } finally {
+      this.callbackDepth -= 1;
     }
   }
 
@@ -450,19 +832,17 @@ export class BatchSettlementChannelManager {
   private async runClaimJob(): Promise<void> {
     const cfg = this.autoSettleConfig;
     try {
-      const targets = await this.selectClaimTargets({
+      const results = await this.claimNow({
         selectClaimChannels: cfg.selectClaimChannels,
-      });
-      const results = await this.claimFromChannels(targets, {
         maxClaimsPerBatch: cfg.maxClaimsPerBatch ?? 100,
       });
 
       this.lastClaimTime = Date.now();
       for (const result of results) {
-        cfg.onClaim?.(result);
+        this.emitHook(cfg.onClaim, result);
       }
     } catch (err) {
-      cfg.onError?.(err);
+      this.reportError(err);
     }
   }
 
@@ -471,21 +851,20 @@ export class BatchSettlementChannelManager {
    */
   private async runSettleJob(): Promise<void> {
     const cfg = this.autoSettleConfig;
-    const context = this.buildAutoSettlementContext(Date.now());
-    if (!context.pendingSettle) {
-      return;
-    }
-
     try {
+      const context = await this.autoSettlementContext(Date.now());
       if (cfg.shouldSettle && !(await cfg.shouldSettle(context))) {
         return;
       }
+      if (!context.pendingSettle) {
+        return;
+      }
 
-      const result = await this.settle();
+      const result = await this.settleNow();
       this.lastSettleTime = Date.now();
-      cfg.onSettle?.(result);
+      this.emitHook(cfg.onSettle, result);
     } catch (err) {
-      cfg.onError?.(err);
+      this.reportError(err);
     }
   }
 
@@ -499,14 +878,14 @@ export class BatchSettlementChannelManager {
     }
 
     try {
-      const context = this.buildAutoSettlementContext(Date.now());
+      const context = await this.autoSettlementContext(Date.now());
       const channels = await this.scheme.getStorage().list();
       const targets = await cfg.selectRefundChannels(channels, context);
       for (const result of await this.refundChannels(targets)) {
-        cfg.onRefund?.(result);
+        this.emitHook(cfg.onRefund, result);
       }
     } catch (err) {
-      cfg.onError?.(err);
+      this.reportError(err);
     }
   }
 
@@ -526,8 +905,11 @@ export class BatchSettlementChannelManager {
       idleSecs?: number;
     },
   ): Promise<ClaimResult[]> {
+    if (!Number.isSafeInteger(opts.maxClaimsPerBatch) || opts.maxClaimsPerBatch <= 0) {
+      throw new Error("maxClaimsPerBatch must be a positive safe integer");
+    }
     const allClaims = this.getClaimableVouchersFromChannels(
-      channels,
+      channels.filter(channel => this.managesChannel(channel)),
       opts.idleSecs !== undefined ? { idleSecs: opts.idleSecs } : undefined,
     );
 
@@ -538,13 +920,16 @@ export class BatchSettlementChannelManager {
     const results: ClaimResult[] = [];
     for (let i = 0; i < allClaims.length; i += opts.maxClaimsPerBatch) {
       const batch = allClaims.slice(i, i + opts.maxClaimsPerBatch);
-      const result = await this.submitClaim(batch);
-      results.push(result);
-      await this.updateClaimedSessions(batch);
-    }
-
-    if (results.length > 0) {
-      this.pendingSettle = true;
+      this.assertResolvedEffect();
+      this.noteFreshObligation();
+      this.activeClaimRefunds += 1;
+      try {
+        const result = await this.submitClaim(structuredClone(batch));
+        results.push(result);
+        await this.updateClaimedSessions(batch);
+      } finally {
+        this.activeClaimRefunds -= 1;
+      }
     }
 
     return results;
@@ -559,13 +944,33 @@ export class BatchSettlementChannelManager {
   private async selectClaimTargets(
     opts?: Pick<ClaimOptions, "selectClaimChannels">,
   ): Promise<Channel[]> {
-    const channels = await this.scheme.getStorage().list();
+    const channels = (await this.scheme.getStorage().list()).filter(channel =>
+      this.managesChannel(channel),
+    );
     if (!opts?.selectClaimChannels) {
       return channels;
     }
 
-    const context = this.buildAutoSettlementContext(Date.now());
+    const context = await this.autoSettlementContext(Date.now());
     return opts.selectClaimChannels(channels, context);
+  }
+
+  /**
+   * Joins an in-process refund. Its pending row is the shared admission, not a second lock.
+   * A pending row with no local flight belongs to another request and is left alone.
+   *
+   * @param channel - Stored channel row
+   * @param now - Current time in milliseconds
+   * @returns Whether this manager may enter or join the refund
+   */
+  private canRefundChannel(channel: Channel, now = Date.now()): boolean {
+    if (!this.managesChannel(channel)) {
+      return false;
+    }
+    if (this.refundFlights.has(channel.channelId.toLowerCase())) {
+      return true;
+    }
+    return !hasLivePendingRequest(channel, now);
   }
 
   /**
@@ -577,7 +982,7 @@ export class BatchSettlementChannelManager {
   private async refundChannels(channels: Channel[]): Promise<RefundResult[]> {
     const results: RefundResult[] = [];
     for (const channel of channels) {
-      if (hasLivePendingRequest(channel)) {
+      if (!this.canRefundChannel(channel)) {
         continue;
       }
       results.push(await this.refundChannel(channel));
@@ -621,6 +1026,47 @@ export class BatchSettlementChannelManager {
       lastSettleTime: this.lastSettleTime,
       pendingSettle: this.pendingSettle,
     };
+  }
+
+  /**
+   * Builds the hook context for this pass.
+   * A configured reader replaces the copied hint with the validated chain
+   * observation. The chain boolean is not written back onto the local hint.
+   *
+   * @param now - Current wall-clock time in milliseconds.
+   * @returns Context whose `pendingSettle` has one meaning for every hook.
+   */
+  private async autoSettlementContext(now: number): Promise<AutoSettlementContext> {
+    const context = this.buildAutoSettlementContext(now);
+    if (!this.readReceiverSettlement) {
+      return context;
+    }
+
+    const snapshot = await this.readScopedSnapshot();
+    return {
+      ...context,
+      pendingSettle: snapshot.totalClaimed > snapshot.totalSettled,
+    };
+  }
+
+  /**
+   * Records a newly claimed obligation that a settle already in flight must not clear.
+   */
+  private noteFreshObligation(): void {
+    this.settleObligation += 1;
+    this.pendingSettle = true;
+  }
+
+  /**
+   * Clears the local hint only when no claim or refund-with-claims committed
+   * after this settle attempt began.
+   *
+   * @param seen - Obligation generation captured at the start of the attempt.
+   */
+  private clearSettledObligation(seen: number): void {
+    if (seen === this.settleObligation && this.activeClaimRefunds === 0 && !this.unresolvedEffect) {
+      this.pendingSettle = false;
+    }
   }
 
   /**
@@ -687,7 +1133,10 @@ export class BatchSettlementChannelManager {
    */
   private async getIdleChannelsForRefund(idleSecs: number): Promise<Channel[]> {
     const channels = await this.scheme.getStorage().list();
-    return this.getIdleChannelsForRefundFromChannels(channels, idleSecs);
+    return this.getIdleChannelsForRefundFromChannels(
+      channels.filter(channel => this.managesChannel(channel)),
+      idleSecs,
+    );
   }
 
   /**
@@ -697,6 +1146,7 @@ export class BatchSettlementChannelManager {
    * @returns Per-batch claim summary (count and transaction hash).
    */
   private async submitClaim(claims: BatchSettlementVoucherClaim[]): Promise<ClaimResult> {
+    unsignedEip155ChainId(this.network);
     const authorizerSigner = this.scheme.getReceiverAuthorizerSigner();
 
     const claimAuthorizerSignature = authorizerSigner
@@ -713,16 +1163,257 @@ export class BatchSettlementChannelManager {
       },
     };
 
-    const response: SettleResponse = await this.facilitator.settle(
-      paymentPayload,
-      this.buildPaymentRequirements(),
-    );
+    const response = await this.sendOperation("Claim", paymentPayload);
 
     if (!response.success) {
       throw new Error(formatFacilitatorFailure("Claim", response));
     }
 
     return { vouchers: claims.length, transaction: response.transaction };
+  }
+
+  /**
+   * Submits one settle for this manager's payTo and token.
+   *
+   * With a reader, an already-equal scope returns `already-settled` and does not
+   * call the facilitator. A success counts only when it names this manager's
+   * network, carries a 32-byte hash and a positive decimal amount, and a fresh
+   * read shows this pair's settled total increased by at least that amount. The
+   * increase does not prove the returned hash caused it. Nothing-to-settle returns
+   * the same noop only when a fresh read shows this scope equal and no newer
+   * claim or refund-with-claims committed during the attempt. A still-pending,
+   * foreign, or malformed observation throws and leaves the obligation in place.
+   * A different or absent response network stays outcome unknown and is not this
+   * manager's completion, even if the pair total later moves.
+   *
+   * Without a reader, facilitator success remains the completion signal. That
+   * legacy path is explicit and is not chain proof. Success clears the local
+   * hint only when the obligation generation is unchanged, so a claim or refund
+   * that commits while the request is in flight is not erased. Nothing-to-settle
+   * without a reader throws and does not clear the hint.
+   *
+   * @returns A settled transaction, or a verified already-settled noop with no transaction.
+   */
+  private async submitSettle(): Promise<SettleResult> {
+    this.assertResolvedEffect();
+    unsignedEip155ChainId(this.network);
+    if (this.activeClaimRefunds > 0) {
+      throw new Error("Settle outcome unknown: a claim or refund is still in flight");
+    }
+    const seenObligation = this.settleObligation;
+    const before = this.readReceiverSettlement ? await this.readScopedSnapshot() : undefined;
+    this.assertResolvedEffect();
+    if (this.activeClaimRefunds > 0) {
+      throw new Error("Settle outcome unknown: a claim or refund is still in flight");
+    }
+    if (
+      before &&
+      before.totalClaimed === before.totalSettled &&
+      seenObligation === this.settleObligation
+    ) {
+      this.clearSettledObligation(seenObligation);
+      return { outcome: "already-settled" };
+    }
+
+    const response = await this.sendOperation("Settle", this.buildSettlePaymentPayload());
+    if (!response.success) {
+      if (response.errorReason === ErrNothingToSettle && before) {
+        const fresh = await this.readScopedSnapshot();
+        if (fresh.totalClaimed === fresh.totalSettled && seenObligation === this.settleObligation) {
+          this.clearSettledObligation(seenObligation);
+          return { outcome: "already-settled" };
+        }
+      }
+      throw new Error(formatFacilitatorFailure("Settle", response));
+    }
+
+    if (response.network !== this.network) {
+      throw new Error(
+        "Settle outcome unknown: facilitator response did not name this manager's network",
+      );
+    }
+
+    if (!/^0x[0-9a-fA-F]{64}$/.test(response.transaction)) {
+      throw new Error(
+        "Settle outcome unknown: facilitator reported success without a transaction hash",
+      );
+    }
+    if (!/^\d+$/.test(response.amount ?? "") || BigInt(response.amount ?? "0") === 0n) {
+      throw this.rememberUnknown(
+        "Settle",
+        "no Settled transfer was observed for this receiver and token",
+      );
+    }
+
+    if (!before) {
+      // A scoped, well-formed facilitator response remains a provider assertion,
+      // not an independently observed transfer.
+      this.clearSettledObligation(seenObligation);
+      return { outcome: "settled", transaction: response.transaction };
+    }
+
+    const amount = BigInt(response.amount ?? "0");
+    let after: ReceiverSettlementSnapshot;
+    try {
+      after = await this.readScopedSnapshot();
+    } catch (error) {
+      throw this.rememberUnknown("Settle", error instanceof Error ? error.message : String(error));
+    }
+    if (after.totalSettled < before.totalSettled + amount) {
+      throw this.rememberUnknown("Settle", "settled total did not increase by the reported amount");
+    }
+    if (after.totalClaimed === after.totalSettled) {
+      this.clearSettledObligation(seenObligation);
+    }
+    return { outcome: "settled", transaction: response.transaction };
+  }
+
+  /**
+   * Reports whether this manager's own network, token, and payTo still have
+   * claimed funds that have not been settled.
+   *
+   * @returns True when a settle should be attempted.
+   */
+  private async observedPending(): Promise<boolean> {
+    if (!this.readReceiverSettlement) {
+      return this.pendingSettle;
+    }
+    const snapshot = await this.readScopedSnapshot();
+    return snapshot.totalClaimed > snapshot.totalSettled;
+  }
+
+  /**
+   * Reads and checks the receiver state for this manager's scope.
+   *
+   * @returns Snapshot of claimed and settled totals for this payTo and token.
+   */
+  private async readScopedSnapshot(): Promise<ReceiverSettlementSnapshot> {
+    if (!this.readReceiverSettlement) {
+      throw new Error("receiver settlement reader is not configured");
+    }
+    unsignedEip155ChainId(this.network);
+    const receiver = getAddress(this.receiver);
+    const token = getAddress(this.token);
+    const snapshot = await this.readReceiverSettlement({
+      network: this.network,
+      receiver: this.receiver,
+      token: this.token,
+    });
+    if (
+      !snapshot ||
+      snapshot.network !== this.network ||
+      getAddress(snapshot.receiver) !== receiver ||
+      getAddress(snapshot.token) !== token
+    ) {
+      throw new Error(
+        "pending settlement observation left this manager's network, token, or payTo",
+      );
+    }
+    const totals = assertReceiverSettlementTotals(snapshot.totalClaimed, snapshot.totalSettled);
+    return {
+      network: snapshot.network,
+      receiver: snapshot.receiver,
+      token: snapshot.token,
+      totalClaimed: totals.totalClaimed,
+      totalSettled: totals.totalSettled,
+    };
+  }
+
+  /**
+   * Storage may be shared across managers; a selector cannot widen this scope.
+   *
+   * @param channel - Stored or selected channel.
+   * @returns Whether its receiver, token, and chain-bound id belong to this manager.
+   */
+  private managesChannel(channel: Channel): boolean {
+    unsignedEip155ChainId(this.network);
+    return (
+      getAddress(channel.channelConfig.receiver) === getAddress(this.receiver) &&
+      getAddress(channel.channelConfig.token) === getAddress(this.token) &&
+      computeChannelId(channel.channelConfig, this.network).toLowerCase() ===
+        channel.channelId.toLowerCase()
+    );
+  }
+
+  /**
+   * Tracks direct work as well as the auto drain; rejection still releases admission.
+   *
+   * @param run - Operation admitted before shutdown.
+   * @returns Its result after all associated work ends.
+   */
+  private async admitOperation<T>(run: () => Promise<T>): Promise<T> {
+    if (this.stopping) throw new Error("channel manager is stopping");
+    this.assertResolvedEffect();
+    const flight = run();
+    this.admittedOperations.add(flight);
+    try {
+      return await flight;
+    } finally {
+      this.admittedOperations.delete(flight);
+    }
+  }
+
+  /** An unknown financial effect is never spending capacity or permission to resend. */
+  private assertResolvedEffect(): void {
+    if (this.unresolvedEffect) throw this.unresolvedEffect;
+  }
+
+  /**
+   * Keeps one unresolved effect on this existing receiver/token manager.
+   *
+   * @param operation - Claim, refund, or settlement label.
+   * @param detail - Observed reason the effect cannot be established.
+   * @returns The retained error for this and subsequent calls.
+   */
+  private rememberUnknown(operation: string, detail: string): Error {
+    const error = new Error(
+      `${operation} outcome unknown: ${detail}; prior effect remains unresolved`,
+    );
+    this.unresolvedEffect = error;
+    this.pendingSettle = true;
+    return error;
+  }
+
+  /**
+   * Checks the provider response before local claim/refund/settle state changes.
+   *
+   * @param operation - Operation label for error reporting.
+   * @param payload - Frozen request and accepted terms.
+   * @returns A scoped, well-formed provider response.
+   */
+  private async sendOperation(operation: string, payload: PaymentPayload): Promise<SettleResponse> {
+    this.assertResolvedEffect();
+    let response: SettleResponse;
+    try {
+      response = await this.facilitator.settle(payload, this.buildPaymentRequirements());
+    } catch (error) {
+      throw this.rememberUnknown(operation, error instanceof Error ? error.message : String(error));
+    }
+    if (!response || typeof response.success !== "boolean") {
+      throw this.rememberUnknown(operation, "facilitator response is malformed");
+    }
+    if (response.network !== this.network) {
+      throw this.rememberUnknown(
+        operation,
+        "facilitator response did not name this manager's network",
+      );
+    }
+    if (response.errorReason === "settlement_pending") {
+      throw this.rememberUnknown(
+        operation,
+        `pending transaction ${response.transaction || "unknown"}`,
+      );
+    }
+    if (response.success && !/^0x[0-9a-fA-F]{64}$/.test(response.transaction)) {
+      throw this.rememberUnknown(
+        operation,
+        "facilitator reported success without a transaction hash",
+      );
+    }
+    if (response.errorReason === ErrNothingToSettle && response.transaction !== "") {
+      throw this.rememberUnknown(operation, "nothing-to-settle response carried a transaction");
+    }
+    return response;
   }
 
   /**

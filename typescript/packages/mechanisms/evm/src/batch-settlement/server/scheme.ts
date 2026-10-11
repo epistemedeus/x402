@@ -9,13 +9,17 @@ import {
   SchemeServerHooks,
   MoneyParser,
   SupportedKind,
+  VerifyResponse,
 } from "@x402/core/types";
 import type { DeepReadonly } from "@x402/core/types";
 import type { SettleContext, SettleResultContext } from "@x402/core/server";
+import type { SettleResponse } from "@x402/core/types";
 import { convertToTokenAmount, parseMoney } from "@x402/core/utils";
 import type { FacilitatorClient } from "@x402/core/server";
 import { getAddress } from "viem";
+import { createNonce } from "../../utils";
 import { BatchSettlementChannelManager } from "./channelManager";
+import type { ReadReceiverSettlement } from "./receiverState";
 import { findDefaultAsset, getDefaultAsset } from "../../defaultAssets";
 import type { AuthorizerSigner, BatchSettlementAssetTransferMethod } from "../types";
 import {
@@ -23,7 +27,12 @@ import {
   DEFAULT_SERVER_MIN_DEPOSIT_MULTIPLIER,
   MIN_WITHDRAW_DELAY,
 } from "../constants";
-import { InMemoryChannelStorage, ChannelStorage, type Channel } from "./storage";
+import {
+  InMemoryChannelStorage,
+  isChannelAdmissionLive,
+  ChannelStorage,
+  type Channel,
+} from "./storage";
 import {
   handleAfterVerify,
   handleBeforeVerify,
@@ -32,6 +41,7 @@ import {
   handleVerifiedPaymentCanceled,
 } from "./verify";
 import {
+  handleAcceptSettlementResult,
   handleAfterSettle,
   handleBeforeSettle,
   handleEnrichSettlementPayload,
@@ -53,6 +63,36 @@ export interface BatchSettlementRequestContext {
   channelSnapshot?: Channel;
   localVerify?: boolean;
   reservationCommitted?: boolean;
+  refundBinding?: string;
+  refundGeneration?: number;
+  refundVerification?: VerifyResponse;
+  /** Set after settlement-result acceptance has already applied this refund. */
+  refundReconciled?: boolean;
+}
+
+/** The original verified HTTP refund and its already signed settlement enrichment. */
+export interface RetainedRefundOperation {
+  binding: string;
+  generation: number;
+  unresolved: boolean;
+  transaction?: string;
+  verification: VerifyResponse;
+  enrichment: Record<string, unknown>;
+  /** Exact amount signed for this admission, including a legitimate clamp. */
+  effectiveAmount?: string;
+  payer?: string;
+  /** Refund nonce before this operation. The confirmed response nonce is one higher. */
+  nonce?: string;
+}
+
+/** Shared storage admission for one manager refund, visible to HTTP voucher verification. */
+export interface ManagerRefundAdmission {
+  channelId: string;
+  binding: string;
+  pendingId: string;
+  generation: number;
+  effectiveAmount: string;
+  channel: Channel;
 }
 
 /**
@@ -71,6 +111,8 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
     DeepReadonly<PaymentPayload>,
     BatchSettlementRequestContext
   >();
+  private readonly retainedRefunds = new Map<string, RetainedRefundOperation>();
+  private refundGeneration = 0;
   private moneyParsers: MoneyParser[] = [];
   private readonly storage: ChannelStorage;
   private readonly receiverAuthorizerSigner: AuthorizerSigner | undefined;
@@ -131,6 +173,14 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
    */
   enrichSettlementResponse = (ctx: SettleResultContext): Promise<Record<string, unknown> | void> =>
     handleEnrichSettlementResponse(this, ctx);
+
+  /**
+   * Opts this mechanism into refund result acceptance. Other batch payloads stay observational.
+   *
+   * @param ctx - Successful settle result for the original payment payload
+   * @returns Accepted, or unresolved with the original retry identity
+   */
+  acceptSettlementResult = (ctx: SettleResultContext) => handleAcceptSettlementResult(this, ctx);
 
   /**
    * Merges batch-settlement state into the current request context.
@@ -222,6 +272,223 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
         pendingRequest: undefined,
       };
     });
+  }
+
+  /**
+   * Reads the original admitted refund, without treating its verification as new chain state.
+   *
+   * @param channelId - Chain-bound channel identity.
+   * @returns Its immutable request binding, verified observation, and signed enrichment.
+   */
+  readRetainedRefund(channelId: string): RetainedRefundOperation | undefined {
+    const operation = this.retainedRefunds.get(channelId.toLowerCase());
+    return operation ? structuredClone(operation) : undefined;
+  }
+
+  /**
+   * Retains the exact verified refund before the facilitator may broadcast it.
+   *
+   * @param channelId - Chain-bound channel identity.
+   * @param operation - Original verification and signed request fields.
+   * @returns Unique admission generation for scoped cleanup.
+   */
+  retainRefund(
+    channelId: string,
+    operation: Pick<
+      RetainedRefundOperation,
+      "binding" | "verification" | "enrichment" | "effectiveAmount" | "payer" | "nonce"
+    >,
+  ): number {
+    const generation = ++this.refundGeneration;
+    this.retainedRefunds.set(channelId.toLowerCase(), {
+      ...structuredClone(operation),
+      generation,
+      unresolved: false,
+    });
+    return generation;
+  }
+
+  /**
+   * Keeps the original financial effect after an uncertain reply; it never expires.
+   *
+   * @param channelId - Chain-bound channel identity.
+   * @param binding - Original request terms.
+   * @param generation - Original admission generation.
+   * @param transaction - Original hash when the scoped pending response supplied one.
+   */
+  markRefundUnresolved(
+    channelId: string,
+    binding: string | undefined,
+    generation: number | undefined,
+    transaction?: string,
+  ): void {
+    const operation = this.retainedRefunds.get(channelId.toLowerCase());
+    if (operation && operation.binding === binding && operation.generation === generation) {
+      operation.unresolved = true;
+      if (operation.transaction === undefined && transaction !== undefined) {
+        operation.transaction = transaction;
+      }
+    }
+  }
+
+  /**
+   * Reserves the shared channel admission before a manager refund snapshot is signed or sent.
+   * The pending row stays live past its TTL until this generation is reconciled or released.
+   *
+   * @param snapshot - Channel row observed by the manager before admission
+   * @param binding - In-process binding of that row's economics
+   * @returns The admitted generation, pending id, and exact refund amount
+   */
+  async reserveManagerRefund(snapshot: Channel, binding: string): Promise<ManagerRefundAdmission> {
+    const channelId = snapshot.channelId;
+    let admitted: Channel | undefined;
+    let pendingId = "";
+    let generation = 0;
+    await this.storage.updateChannel(channelId, current => {
+      if (
+        !current ||
+        !sameManagerEconomics(current, snapshot) ||
+        isChannelAdmissionLive(current.pendingRequest, Date.now()) ||
+        this.retainedRefunds.has(channelId.toLowerCase())
+      ) {
+        return current;
+      }
+      const remainder = BigInt(current.balance) - BigInt(current.chargedCumulativeAmount);
+      if (remainder <= 0n) {
+        return current;
+      }
+      generation = ++this.refundGeneration;
+      pendingId = createNonce();
+      admitted = current;
+      return {
+        ...current,
+        pendingRequest: {
+          pendingId,
+          signedMaxClaimable: current.signedMaxClaimable,
+          expiresAt: Date.now(),
+          unresolved: true,
+          generation,
+        },
+      };
+    });
+    if (!admitted) {
+      throw new Error("refund already admitted with different channel amounts or terms");
+    }
+    const effectiveAmount = (
+      BigInt(admitted.balance) - BigInt(admitted.chargedCumulativeAmount)
+    ).toString();
+    this.retainedRefunds.set(channelId.toLowerCase(), {
+      binding,
+      generation,
+      unresolved: false,
+      verification: { isValid: true, payer: admitted.channelConfig.payer },
+      enrichment: { effectiveAmount },
+      effectiveAmount,
+      payer: admitted.channelConfig.payer,
+      nonce: String(admitted.refundNonce ?? 0),
+    });
+    return {
+      channelId,
+      binding,
+      pendingId,
+      generation,
+      effectiveAmount,
+      channel: structuredClone(admitted),
+    };
+  }
+
+  /**
+   * Releases, retains, or deletes one manager refund without touching another generation.
+   *
+   * @param admission - Admission returned by {@link reserveManagerRefund}
+   * @param outcome - Release a known refusal, keep an unknown effect, or delete a confirmed row
+   * @param response - Facilitator response for a confirmed refund
+   */
+  async concludeManagerRefund(
+    admission: ManagerRefundAdmission,
+    outcome: "release" | "unknown" | "reconcile",
+    response?: SettleResponse,
+  ): Promise<void> {
+    if (outcome === "unknown") {
+      const transaction =
+        response && response.network && /^0x[0-9a-fA-F]{64}$/.test(response.transaction)
+          ? response.transaction
+          : undefined;
+      this.markRefundUnresolved(
+        admission.channelId,
+        admission.binding,
+        admission.generation,
+        transaction,
+      );
+      await this.storage.updateChannel(admission.channelId, current => {
+        if (
+          !current?.pendingRequest ||
+          current.pendingRequest.pendingId !== admission.pendingId ||
+          current.pendingRequest.generation !== admission.generation
+        ) {
+          return current;
+        }
+        return {
+          ...current,
+          pendingRequest: { ...current.pendingRequest, unresolved: true },
+        };
+      });
+      return;
+    }
+
+    if (outcome === "release") {
+      await this.storage.updateChannel(admission.channelId, current => {
+        if (
+          !current?.pendingRequest ||
+          current.pendingRequest.pendingId !== admission.pendingId ||
+          current.pendingRequest.generation !== admission.generation
+        ) {
+          return current;
+        }
+        return { ...current, pendingRequest: undefined };
+      });
+      this.releaseRetainedRefund(admission.channelId, admission.binding, admission.generation);
+      return;
+    }
+
+    const updateResult = await this.storage.updateChannel(admission.channelId, current => {
+      if (
+        !current ||
+        current.pendingRequest?.pendingId !== admission.pendingId ||
+        current.pendingRequest?.generation !== admission.generation ||
+        !sameManagerEconomics(current, admission.channel)
+      ) {
+        return current;
+      }
+      return undefined;
+    });
+    if (updateResult.status !== "deleted") {
+      throw new Error("Refund outcome unknown: storage did not reconcile the owning generation");
+    }
+    this.releaseRetainedRefund(admission.channelId, admission.binding, admission.generation);
+  }
+
+  /**
+   * Releases only the original operation after a confirmed or known refused outcome.
+   *
+   * @param channelId - Chain-bound channel identity.
+   * @param binding - Exact request that received that outcome.
+   * @param generation - Original admission; stale callbacks cannot release a later refund.
+   */
+  releaseRetainedRefund(
+    channelId: string,
+    binding: string | undefined,
+    generation: number | undefined,
+  ): void {
+    const key = channelId.toLowerCase();
+    const operation = this.retainedRefunds.get(key);
+    if (
+      binding !== undefined &&
+      operation?.binding === binding &&
+      operation.generation === generation
+    ) {
+      this.retainedRefunds.delete(key);
+    }
   }
 
   /**
@@ -421,12 +688,16 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
    * @param network - CAIP-2 network identifier (e.g. `"eip155:84532"`).
    * @param token - Explicit token address to use. Falls back to the network's
    *   default asset (from the registry) when omitted.
+   * @param options - Optional chain observation for claimed-but-unsettled funds.
+   * @param options.readReceiverSettlement - Reads `receivers(payTo, token)` on
+   *   this network. Client-initiated refunds are visible only through this read.
    * @returns A ready-to-use channel manager.
    */
   createChannelManager(
     facilitator: FacilitatorClient,
     network: Network,
     token?: `0x${string}`,
+    options?: { readReceiverSettlement?: ReadReceiverSettlement },
   ): BatchSettlementChannelManager {
     const resolvedToken = token ?? (getDefaultAsset(network).asset as `0x${string}`);
     return new BatchSettlementChannelManager({
@@ -435,6 +706,7 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
       receiver: this.receiverAddress,
       token: resolvedToken,
       network,
+      readReceiverSettlement: options?.readReceiverSettlement,
     });
   }
 
@@ -539,6 +811,25 @@ export class BatchSettlementEvmScheme implements SchemeNetworkServer {
       },
     };
   }
+}
+
+/**
+ * Compares the economics a manager refund is allowed to release or delete.
+ *
+ * @param current - Stored channel row
+ * @param snapshot - Row admitted before the refund was signed
+ * @returns Whether the row still belongs to that admission
+ */
+function sameManagerEconomics(current: Channel, snapshot: Channel): boolean {
+  return (
+    current.channelId.toLowerCase() === snapshot.channelId.toLowerCase() &&
+    current.balance === snapshot.balance &&
+    current.chargedCumulativeAmount === snapshot.chargedCumulativeAmount &&
+    current.totalClaimed === snapshot.totalClaimed &&
+    current.signedMaxClaimable === snapshot.signedMaxClaimable &&
+    current.signature === snapshot.signature &&
+    (current.refundNonce ?? 0) === (snapshot.refundNonce ?? 0)
+  );
 }
 
 /**

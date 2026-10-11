@@ -1,5 +1,6 @@
 import {
   x402ResourceServer,
+  SETTLEMENT_UNRESOLVED_REASON,
   SettlementOverrides,
   SkipHandlerDirective,
   PaymentCancellationDispatcher,
@@ -846,6 +847,9 @@ export class x402HTTPResourceServer {
       );
 
       if (!settleResponse.success) {
+        if (settleResponse.errorReason === SETTLEMENT_UNRESOLVED_REASON) {
+          return this.unresolvedSettlementResult(settleResponse);
+        }
         const errorReason = settleResponse.errorReason || "Settlement failed";
         const failure = {
           ...settleResponse,
@@ -870,6 +874,16 @@ export class x402HTTPResourceServer {
       }
       if (error instanceof SettleError) {
         const errorReason = error.errorReason || error.message;
+        if (errorReason === SETTLEMENT_UNRESOLVED_REASON) {
+          return this.unresolvedSettlementResult({
+            success: false,
+            errorReason,
+            errorMessage: error.errorMessage || errorReason,
+            payer: error.payer,
+            network: error.network,
+            transaction: error.transaction,
+          });
+        }
         const settleResponse: SettleResponse = {
           success: false,
           errorReason,
@@ -975,6 +989,42 @@ export class x402HTTPResourceServer {
     return {
       ...this.createSettlementHeaders(receipt),
       "Cache-Control": withPrivateCacheControl(existingCacheControl ?? null),
+    };
+  }
+
+  /**
+   * Returns the original settle attempt as HTTP 409. The body is not a new 402 challenge.
+   *
+   * @param settleResponse - Quarantined settle result and its retry identity
+   * @returns Failure result whose response carries the original hash and network
+   */
+  private unresolvedSettlementResult(settleResponse: SettleResponse): ProcessSettleFailureResponse {
+    const headers = {
+      ...this.createSettlementHeaders(settleResponse),
+      "Content-Type": "application/json",
+      "Cache-Control": "private, no-store",
+    };
+    const retryIdentity = settleResponse.extra?.retryIdentity ?? {
+      network: settleResponse.network,
+      transaction: settleResponse.transaction,
+    };
+    return {
+      ...settleResponse,
+      success: false,
+      errorReason: SETTLEMENT_UNRESOLVED_REASON,
+      errorMessage: settleResponse.errorMessage || SETTLEMENT_UNRESOLVED_REASON,
+      headers,
+      response: {
+        status: 409,
+        headers,
+        body: {
+          settlementOutcome: "unresolved",
+          retryIdentity,
+          transaction: settleResponse.transaction,
+          network: settleResponse.network,
+        },
+        isHtml: false,
+      },
     };
   }
 

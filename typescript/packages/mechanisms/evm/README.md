@@ -147,6 +147,38 @@ Supports two asset transfer methods:
 
 For the current list of chains with default assets configured, see [Default Assets for Dollar-String Pricing](../../../../docs/core-concepts/network-and-token-support.mdx#default-assets-for-dollar-string-pricing) in the x402 docs. To add default asset support for a new chain, see [Adding Support for New Networks](../../../../docs/core-concepts/network-and-token-support.mdx#adding-support-for-new-networks).
 
+## Batch settlement refund recovery
+
+The reader and lifecycle behavior in this section is proposed source in this tree. It is not functionality already shipped in `@x402/evm` 2.28.0.
+
+A server refund, an idle refund, and a client `scheme.refund` can leave claimed funds unsettled on this manager's receiver and token. Pass `readBatchSettlementReceiverState` as the fourth argument to `createChannelManager` so automatic settle, `claimAndSettle`, and `stop({ flush: true })` read that pair and settle only when `totalClaimed` is greater than `totalSettled`.
+
+```typescript
+import { createPublicClient, http } from "viem";
+import { baseSepolia } from "viem/chains";
+import {
+  BatchSettlementEvmScheme,
+  readBatchSettlementReceiverState,
+} from "@x402/evm/batch-settlement/server";
+
+const publicClient = createPublicClient({
+  chain: baseSepolia,
+  transport: http(rpcUrl),
+});
+const scheme = new BatchSettlementEvmScheme(payTo);
+const channels = scheme.createChannelManager(facilitatorClient, "eip155:84532", token, {
+  readReceiverSettlement: scope => readBatchSettlementReceiverState(publicClient, scope),
+});
+```
+
+The reader is optional. Without it, the manager keeps only a process-local hint after an in-process claim or a refund that submitted claims. An HTTP-only resource server does not recover a client refund by default. A later increase in the settled total does not prove that a particular facilitator hash caused the transfer.
+
+`settle()` returns `outcome: "settled"` and a facilitator transaction string when a transfer is accepted. When a validated read shows this scope is already equal, or a fresh read shows that after `invalid_batch_settlement_evm_nothing_to_settle`, it returns `outcome: "already-settled"` and no transaction. That result is not a transfer. A still-pending, foreign, or malformed observation still fails and leaves the obligation in place. Without a reader, nothing-to-settle still fails and does not clear the hint.
+
+Claim, refund, and settle hooks in one pass share that validated observation. An invalid read is reported to the caller or `onError` and is not presented as `true` or `false`. `stop({ flush: true })` waits for an admitted auto job before one final claim-and-settle. A stop requested from a hook does not wait on the job that called the hook. A later `start()` can run again.
+
+Whether `readReceiverSettlement` stays on the local client or moves onto `FacilitatorClient` is still an open interface choice. This tree does not decide it.
+
 ## Development
 
 ```bash

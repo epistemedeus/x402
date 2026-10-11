@@ -1887,7 +1887,7 @@ describe("BatchSettlementEvmScheme (Facilitator) — settle routing", () => {
     expect(result.transaction).toBe("0x" + "ab".repeat(32));
   });
 
-  it("fails terminally (not settlement_pending) when the settle broadcast returns an invalid hash", async () => {
+  it("keeps an invalid broadcast hash outcome unknown without permitting resend", async () => {
     const signer = buildSigner({
       writeContract: vi.fn().mockResolvedValue("not-a-hash" as `0x${string}`),
     });
@@ -1902,7 +1902,7 @@ describe("BatchSettlementEvmScheme (Facilitator) — settle routing", () => {
       makeRequirements(),
     );
     expect(result.success).toBe(false);
-    expect(result.errorReason).toBe(Errors.ErrSettleTransactionFailed);
+    expect(result.errorReason).toBe("settlement_pending");
     expect(result.transaction).toBe("");
   });
 
@@ -2029,7 +2029,7 @@ describe("BatchSettlementEvmScheme (Facilitator) — settle routing", () => {
       makeRequirements(),
     );
     expect(result.success).toBe(false);
-    expect(result.errorReason).toBe(Errors.ErrClaimTransactionFailed);
+    expect(result.errorReason).toBe("settlement_pending");
   });
 
   it("returns AuthorizerAddressMismatch when claim authorizer doesn't match config", async () => {
@@ -2373,7 +2373,7 @@ describe("BatchSettlementEvmScheme (Facilitator) — settle routing", () => {
       makeRequirements(),
     );
     expect(result.success).toBe(false);
-    expect(result.errorReason).toBe(Errors.ErrSettleTransactionFailed);
+    expect(result.errorReason).toBe("settlement_pending");
     expect(result.errorMessage).toContain("replacement underpriced");
   });
 
@@ -2387,7 +2387,7 @@ describe("BatchSettlementEvmScheme (Facilitator) — settle routing", () => {
       makeRequirements(),
     );
     expect(result.success).toBe(false);
-    expect(result.errorReason).toBe(Errors.ErrSettleTransactionFailed);
+    expect(result.errorReason).toBe("settlement_pending");
     expect(result.errorMessage).toBe("replacement underpriced");
   });
 
@@ -2586,7 +2586,7 @@ describe("BatchSettlementEvmScheme (Facilitator) — no authorizer configured", 
       makeRequirements(),
     );
     expect(result.success).toBe(false);
-    expect(result.errorReason).toBe(Errors.ErrRefundTransactionFailed);
+    expect(result.errorReason).toBe("settlement_pending");
     expect(result.errorMessage).toContain("nonce too low");
   });
 
@@ -3112,5 +3112,214 @@ describe("BatchSettlementEvmScheme (Facilitator) — handler contract constants"
       expect(isAddress(a)).toBe(true);
     }
     expect(new Set(addrs.map(a => getAddress(a))).size).toBe(3);
+  });
+});
+
+describe("211204 admitted batch operation retries", () => {
+  function receivingPayload(
+    action: "claim" | "refund" | "settle",
+    authorizer: AuthorizerSigner,
+  ): PaymentPayload {
+    const config = buildChannelConfig({ receiverAuthorizer: authorizer.address });
+    if (action === "settle")
+      return envelopeSettle({ type: "settle", receiver: RECEIVER, token: ASSET });
+    if (action === "claim")
+      return envelopeSettle({
+        type: "claim",
+        claims: [
+          {
+            voucher: { channel: config, maxClaimableAmount: "1000" },
+            signature: "0xcafe",
+            totalClaimed: "1000",
+          },
+        ],
+      });
+    return envelopeSettle({
+      type: "refund",
+      channelConfig: config,
+      voucher: {
+        channelId: computeChannelId(config),
+        maxClaimableAmount: "0",
+        signature: "0xdead",
+      },
+      amount: "9000",
+      refundNonce: "0",
+      claims: [],
+    });
+  }
+
+  it.each(["claim", "refund", "settle"] as const)(
+    "reconciles a pending %s without a second signature or broadcast",
+    async action => {
+      mockedMulticall.mockResolvedValue([
+        { status: "success", result: [10000n, 0n] },
+        { status: "success", result: [0n, 0n] },
+        { status: "success", result: 0n },
+      ]);
+      const authorizer = buildAuthorizerSigner();
+      const signing = vi.spyOn(authorizer, "signTypedData");
+      const signer = buildSigner({
+        waitForTransactionReceipt: vi.fn().mockRejectedValue(new Error("receipt not observed")),
+      });
+      const scheme = new BatchSettlementEvmScheme(signer, authorizer);
+      const payload = receivingPayload(action, authorizer);
+      const first = await scheme.settle(payload, makeRequirements());
+      const signatures = signing.mock.calls.length;
+      const second = await scheme.settle(payload, makeRequirements());
+      expect(first.errorReason).toBe("settlement_pending");
+      expect(second.errorReason).toBe("settlement_pending");
+      expect(signer.writeContract).toHaveBeenCalledTimes(1);
+      expect(signing).toHaveBeenCalledTimes(signatures);
+      expect(signer.waitForTransactionReceipt).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("does not resend a pending refund under changed amount or terms", async () => {
+    mockedMulticall.mockResolvedValue([
+      { status: "success", result: [10000n, 0n] },
+      { status: "success", result: [0n, 0n] },
+      { status: "success", result: 0n },
+    ]);
+    const authorizer = buildAuthorizerSigner();
+    const signer = buildSigner({
+      waitForTransactionReceipt: vi.fn().mockRejectedValue(new Error("pending")),
+    });
+    const scheme = new BatchSettlementEvmScheme(signer, authorizer);
+    const payload = receivingPayload("refund", authorizer);
+    await scheme.settle(payload, makeRequirements());
+    const changed = structuredClone(payload);
+    changed.payload.amount = "8000";
+    const amountResult = await scheme.settle(changed, makeRequirements());
+    const termsResult = await scheme.settle(
+      payload,
+      makeRequirements({ amount: "2000", extra: { offer: "changed" } }),
+    );
+    expect(amountResult.success).toBe(false);
+    expect(termsResult.success).toBe(false);
+    expect(signer.writeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["payer", "payee", "token", "network", "amount", "nonce", "terms"] as const)(
+    "does not reuse a pending refund under changed %s",
+    async field => {
+      mockedMulticall.mockResolvedValue([
+        { status: "success", result: [10000n, 0n] },
+        { status: "success", result: [0n, 0n] },
+        { status: "success", result: 0n },
+      ]);
+      const authorizer = buildAuthorizerSigner();
+      const signing = vi.spyOn(authorizer, "signTypedData");
+      const signer = buildSigner({
+        waitForTransactionReceipt: vi.fn().mockRejectedValue(new Error("pending")),
+      });
+      const scheme = new BatchSettlementEvmScheme(signer, authorizer);
+      const payload = receivingPayload("refund", authorizer);
+      const req = makeRequirements();
+      await scheme.settle(payload, req);
+      const signatures = signing.mock.calls.length;
+      const changed = structuredClone(payload);
+      const changedReq = structuredClone(req);
+      const config = changed.payload.channelConfig as ChannelConfig;
+      if (field === "payer") config.payer = ZERO_ADDR;
+      if (field === "payee") config.receiver = ZERO_ADDR;
+      if (field === "token") config.token = ZERO_ADDR;
+      if (field === "network") {
+        changed.accepted.network = "eip155:1";
+        changedReq.network = "eip155:1";
+      }
+      if (field === "amount") changed.payload.amount = "8000";
+      if (field === "nonce") changed.payload.refundNonce = "1";
+      if (field === "terms") changedReq.maxTimeoutSeconds = 12;
+      const result = await scheme.settle(changed, changedReq);
+      expect(result.success).toBe(false);
+      expect(signer.writeContract).toHaveBeenCalledTimes(1);
+      expect(signing).toHaveBeenCalledTimes(signatures);
+    },
+  );
+
+  it("resolves a pending original hash after rejecting a foreign receipt", async () => {
+    const tx = `0x${"ab".repeat(32)}`;
+    const signer = buildSigner({
+      waitForTransactionReceipt: vi
+        .fn()
+        .mockResolvedValueOnce({
+          status: "success",
+          transactionHash: `0x${"cd".repeat(32)}`,
+          logs: [buildSettledLog()],
+        })
+        .mockResolvedValue({ status: "success", transactionHash: tx, logs: [buildSettledLog()] }),
+    });
+    const authorizer = buildAuthorizerSigner();
+    const scheme = new BatchSettlementEvmScheme(signer, authorizer);
+    const payload = receivingPayload("settle", authorizer);
+    const first = await scheme.settle(payload, makeRequirements());
+    expect(first.errorReason).toBe("settlement_pending");
+    const second = await scheme.settle(payload, makeRequirements());
+    expect(second).toMatchObject({ success: true, transaction: tx, amount: "2500" });
+    expect(signer.writeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not broadcast again after the original write throws without a known hash", async () => {
+    const signer = buildSigner({
+      writeContract: vi.fn().mockRejectedValue(new Error("reply lost")),
+    });
+    const authorizer = buildAuthorizerSigner();
+    const scheme = new BatchSettlementEvmScheme(signer, authorizer);
+    const payload = receivingPayload("settle", authorizer);
+    expect((await scheme.settle(payload, makeRequirements())).errorReason).toBe(
+      "settlement_pending",
+    );
+    expect((await scheme.settle(payload, makeRequirements())).errorReason).toBe(
+      "settlement_pending",
+    );
+    expect(signer.writeContract).toHaveBeenCalledTimes(1);
+    expect(signer.waitForTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  it("does not broadcast again after an invalid hash was returned", async () => {
+    const signer = buildSigner({ writeContract: vi.fn().mockResolvedValue("0xtx") });
+    const authorizer = buildAuthorizerSigner();
+    const scheme = new BatchSettlementEvmScheme(signer, authorizer);
+    const payload = receivingPayload("settle", authorizer);
+    expect((await scheme.settle(payload, makeRequirements())).errorReason).toBe(
+      "settlement_pending",
+    );
+    expect((await scheme.settle(payload, makeRequirements())).errorReason).toBe(
+      "settlement_pending",
+    );
+    expect(signer.writeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains pending continuity past the deposit store TTL", async () => {
+    vi.useFakeTimers();
+    try {
+      const signer = buildSigner({
+        waitForTransactionReceipt: vi.fn().mockRejectedValue(new Error("pending")),
+      });
+      const authorizer = buildAuthorizerSigner();
+      const scheme = new BatchSettlementEvmScheme(signer, authorizer);
+      const payload = receivingPayload("settle", authorizer);
+      await scheme.settle(payload, makeRequirements());
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      const retried = await scheme.settle(payload, makeRequirements());
+      expect(retried.errorReason).toBe("settlement_pending");
+      expect(signer.writeContract).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an unknown receipt status pending instead of terminal or successful", async () => {
+    const authorizer = buildAuthorizerSigner();
+    const signer = buildSigner({
+      waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "pending" }),
+    });
+    const scheme = new BatchSettlementEvmScheme(signer, authorizer);
+    const payload = receivingPayload("settle", authorizer);
+    const first = await scheme.settle(payload, makeRequirements());
+    const second = await scheme.settle(payload, makeRequirements());
+    expect(first.errorReason).toBe("settlement_pending");
+    expect(second.success).toBe(false);
+    expect(signer.writeContract).toHaveBeenCalledTimes(1);
   });
 });

@@ -5,8 +5,9 @@ import { BatchSettlementSettlePayload } from "../types";
 import { batchSettlementABI } from "../abi";
 import { BATCH_SETTLEMENT_ADDRESS } from "../constants";
 import * as Errors from "../errors";
-import { truncateErrorMessage } from "../../utils";
+import { isValidTxHash, truncateErrorMessage } from "../../utils";
 import { waitAndReturnSettleResponse } from "../../shared/settleReceipt";
+import type { BatchOperation } from "./operation";
 
 /**
  * Explicit gas limit for the `settle` transaction.
@@ -36,6 +37,7 @@ const SETTLE_GAS_LIMIT = 120_000n;
  * @param payload - Settle payload containing the receiver address and token address.
  * @param requirements - Payment requirements for network identification.
  * @param dataSuffix - Optional hex suffix appended to the settlement transaction.
+ * @param operation - Instance-owned continuation for exact pending retries.
  * @returns A {@link SettleResponse} with the transaction hash on success.
  */
 export async function executeSettle(
@@ -43,7 +45,9 @@ export async function executeSettle(
   payload: BatchSettlementSettlePayload,
   requirements: PaymentRequirements,
   dataSuffix?: `0x${string}`,
+  operation?: BatchOperation,
 ): Promise<SettleResponse> {
+  if (operation?.confirm) return operation.confirm();
   const network = requirements.network;
   const contractAddr = getAddress(BATCH_SETTLEMENT_ADDRESS);
   const receiver = getAddress(payload.receiver);
@@ -105,25 +109,32 @@ export async function executeSettle(
       dataSuffix,
     });
 
-    return await waitAndReturnSettleResponse(signer, tx, network, undefined, {
-      failedStatusReason: Errors.ErrSettleTransactionFailed,
-      onSuccess: receipt => {
-        let amount = "";
-        if (receipt.logs) {
-          const logs = parseEventLogs({
-            abi: batchSettlementABI,
-            eventName: "Settled",
-            logs: receipt.logs.filter(log => isAddressEqual(log.address, contractAddr)),
-          });
-          const settledLog = logs.find(
-            log =>
-              isAddressEqual(log.args.receiver, receiver) && isAddressEqual(log.args.token, token),
-          );
-          amount = settledLog?.args.amount.toString() ?? "0";
-        }
-        return { success: true, transaction: tx, network, amount };
-      },
-    });
+    const confirm = () =>
+      waitAndReturnSettleResponse(signer, tx, network, undefined, {
+        failedStatusReason: Errors.ErrSettleTransactionFailed,
+        onSuccess: receipt => {
+          let amount = "";
+          if (receipt.logs) {
+            const logs = parseEventLogs({
+              abi: batchSettlementABI,
+              eventName: "Settled",
+              logs: receipt.logs.filter(log => isAddressEqual(log.address, contractAddr)),
+            });
+            const settledLog = logs.find(
+              log =>
+                isAddressEqual(log.args.receiver, receiver) &&
+                isAddressEqual(log.args.token, token),
+            );
+            amount = settledLog?.args.amount.toString() ?? "0";
+          }
+          return { success: true, transaction: tx, network, amount };
+        },
+      });
+    if (operation && isValidTxHash(tx)) {
+      operation.transaction = tx;
+      operation.confirm = confirm;
+    }
+    return await confirm();
   } catch (e) {
     return {
       success: false,

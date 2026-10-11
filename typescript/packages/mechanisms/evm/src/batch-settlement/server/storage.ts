@@ -20,6 +20,23 @@ export interface PendingRequest {
   pendingId: string;
   signedMaxClaimable: string;
   expiresAt: number;
+  /** Holds the row after the short TTL when the financial outcome is still unknown. */
+  unresolved?: boolean;
+  /** Admission generation that may delete or release this row. */
+  generation?: number;
+}
+
+/**
+ * A channel admission is live while its outcome is unknown or its TTL has not elapsed.
+ * HTTP voucher verification and manager refunds share this predicate. There is no
+ * second lock.
+ *
+ * @param pending - Stored reservation, when one exists.
+ * @param now - Current time in milliseconds.
+ * @returns Whether another financial effect must wait.
+ */
+export function isChannelAdmissionLive(pending: PendingRequest | undefined, now: number): boolean {
+  return pending !== undefined && (pending.unresolved === true || pending.expiresAt > now);
 }
 
 export interface ChannelUpdateResult {

@@ -34,7 +34,7 @@ import {
   resolveClientOptions,
   validateDepositPolicy,
 } from "./config";
-import { refundChannel, type RefundOptions } from "./refund";
+import { refundChannel, type RefundAttempt, type RefundOptions } from "./refund";
 import { type BatchSettlementClientDeps, buildChannelConfig, recoverChannel } from "./channel";
 import { createBatchSettlementClientHooks } from "./hooks";
 import { processCorrectivePaymentRequired } from "./recovery";
@@ -67,6 +67,7 @@ export class BatchSettlementEvmScheme implements SchemeNetworkClient {
   readonly schemeHooks: SchemeClientHooks;
 
   private readonly storage: ClientChannelStorage;
+  private readonly refundAttempts = new Map<string, RefundAttempt>();
   private readonly depositPolicy: BatchSettlementDepositPolicy | undefined;
   private readonly depositStrategy: BatchSettlementDepositStrategy | undefined;
   private readonly salt: `0x${string}`;
@@ -135,6 +136,11 @@ export class BatchSettlementEvmScheme implements SchemeNetworkClient {
     const channelId = computeChannelId(config, paymentRequirements.network);
     const key = channelId.toLowerCase();
 
+    if (this.refundAttempts.has(key)) {
+      throw new Error(
+        "Payment outcome unknown: an admitted refund remains unresolved for this channel",
+      );
+    }
     let batchedCtx = await this.storage.get(key);
     if (batchedCtx === undefined && this.signer.readContract) {
       batchedCtx = await recoverChannel(deps, paymentRequirements);
@@ -374,6 +380,7 @@ export class BatchSettlementEvmScheme implements SchemeNetworkClient {
       salt: this.salt,
       payerAuthorizer: this.payerAuthorizer,
       voucherSigner: this.voucherSigner,
+      refundAttempts: this.refundAttempts,
     };
   }
 }

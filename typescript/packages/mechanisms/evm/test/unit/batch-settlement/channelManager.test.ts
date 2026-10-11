@@ -25,6 +25,7 @@ const PAYER = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as `0x${string}`;
 const TOKEN = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" as `0x${string}`;
 const ZERO = "0x0000000000000000000000000000000000000000" as `0x${string}`;
 const NETWORK = "eip155:84532";
+const TX = `0x${"ab".repeat(32)}`;
 
 function computeChannelId(config: ChannelConfig): `0x${string}` {
   return computeChannelIdForNetwork(config, NETWORK);
@@ -91,10 +92,14 @@ function buildFacilitator(
   settleImpl: (
     payload: PaymentPayload,
     reqs: PaymentRequirements,
-  ) => Promise<SettleResponse> = async (_, reqs) => ({
+  ) => Promise<SettleResponse> = async (payload, reqs) => ({
     success: true,
-    transaction: "0xtx",
+    transaction: TX,
     network: reqs.network,
+    amount:
+      typeof (payload.payload as { amount?: unknown }).amount === "string"
+        ? (payload.payload as { amount: string }).amount
+        : "1000",
   }),
 ): FakeFacilitator {
   return {
@@ -156,7 +161,7 @@ describe("BatchSettlementChannelManager — claim()", () => {
     const results = await manager.claim();
     expect(results).toHaveLength(1);
     expect(results[0].vouchers).toBe(1);
-    expect(results[0].transaction).toBe("0xtx");
+    expect(results[0].transaction).toBe(TX);
 
     expect(facilitator.settle).toHaveBeenCalledTimes(1);
     const [paymentPayload] = facilitator.settle.mock.calls[0];
@@ -305,7 +310,7 @@ describe("BatchSettlementChannelManager — settle()", () => {
     const { manager, facilitator } = buildManager();
     const result = await manager.settle();
 
-    expect(result.transaction).toBe("0xtx");
+    expect(result.transaction).toBe(TX);
     const [paymentPayload, reqs] = facilitator.settle.mock.calls[0];
     expect((paymentPayload.payload as Record<string, unknown>).type).toBe("settle");
     expect((paymentPayload.payload as Record<string, unknown>).receiver).toBe(RECEIVER);
@@ -342,7 +347,7 @@ describe("BatchSettlementChannelManager — claimAndSettle()", () => {
 
     const result = await manager.claimAndSettle();
     expect(result.claims).toHaveLength(1);
-    expect(result.settle?.transaction).toBe("0xtx");
+    expect(result.settle?.transaction).toBe(TX);
     expect(facilitator.settle).toHaveBeenCalledTimes(2);
   });
 
@@ -378,7 +383,7 @@ describe("BatchSettlementChannelManager — refund()", () => {
     const idUpper = session.channelId.toUpperCase().replace("0X", "0x");
     const result = await manager.refund([idUpper]);
 
-    expect(result).toEqual([{ channel: session.channelId, transaction: "0xtx" }]);
+    expect(result).toEqual([{ channel: session.channelId, transaction: TX }]);
     expect(facilitator.settle).toHaveBeenCalledTimes(1);
     const [paymentPayload] = facilitator.settle.mock.calls[0];
     const payload = paymentPayload.payload as Record<string, unknown>;
@@ -445,7 +450,7 @@ describe("BatchSettlementChannelManager — refund()", () => {
 
     const result = await manager.refundIdleChannels({ idleSecs: 60 });
 
-    expect(result).toEqual([{ channel: idle.channelId, transaction: "0xtx" }]);
+    expect(result).toEqual([{ channel: idle.channelId, transaction: TX }]);
     expect(await storage.get(idle.channelId)).toBeUndefined();
     expect(await storage.get(fresh.channelId)).toBeDefined();
   });
@@ -563,7 +568,7 @@ describe("BatchSettlementChannelManager — start()/stop() loop", () => {
           network: NETWORK,
         };
       }
-      return { success: true, transaction: "0xtx", network: NETWORK };
+      return { success: true, transaction: TX, network: NETWORK, amount: "1000" };
     });
     const { manager, storage } = buildManager({ facilitator });
     const session = buildSession({ chargedCumulativeAmount: "1000", balance: "10000" });
@@ -767,7 +772,7 @@ describe("BatchSettlementChannelManager — auto-loop tick policies", () => {
     await vi.runAllTicks();
 
     await manager.stop();
-    expect(onRefund).toHaveBeenCalledWith({ channel: selected.channelId, transaction: "0xtx" });
+    expect(onRefund).toHaveBeenCalledWith({ channel: selected.channelId, transaction: TX });
     expect(await storage.get(selected.channelId)).toBeUndefined();
     expect(await storage.get(skipped.channelId)).toBeDefined();
   });
@@ -789,4 +794,61 @@ describe("BatchSettlementChannelManager — auto-loop tick policies", () => {
     await manager.stop();
     expect(onError).toHaveBeenCalled();
   });
+});
+
+describe("211204 concurrent direct admission", () => {
+  it.each(["claim", "refund"] as const)(
+    "shares one exact %s without another authorizer signature",
+    async action => {
+      let release!: () => void;
+      let entered!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      const arrived = new Promise<void>(resolve => {
+        entered = resolve;
+      });
+      const authorizer = buildAuthorizerSigner();
+      const signing = vi.spyOn(authorizer, "signTypedData");
+      const facilitator = buildFacilitator(async (payload, reqs) => {
+        entered();
+        await gate;
+        const amount = (payload.payload as { amount?: unknown }).amount;
+        return {
+          success: true,
+          transaction: TX,
+          network: reqs.network,
+          amount: typeof amount === "string" ? amount : "1000",
+        };
+      });
+      const { manager, storage } = buildManager({ authorizerSigner: authorizer, facilitator });
+      const session = buildSession();
+      await storeChannel(storage, session);
+      const first = manager[action]();
+      await arrived;
+      const signatures = signing.mock.calls.length;
+      const second = manager[action]();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const callsBeforeRelease = facilitator.settle.mock.calls.length;
+      const signaturesBeforeRelease = signing.mock.calls.length;
+      release();
+      await Promise.all([first, second]);
+      expect(callsBeforeRelease).toBe(1);
+      expect(signaturesBeforeRelease).toBe(signatures);
+    },
+  );
+
+  it.each([0, -1, 0.5, Number.NaN, Infinity])(
+    "rejects unsafe batch size %s before a financial effect",
+    async maxClaimsPerBatch => {
+      const facilitator = buildFacilitator(async () => {
+        throw new Error("unexpected financial attempt");
+      });
+      const { manager, storage } = buildManager({ facilitator });
+      const session = buildSession();
+      await storeChannel(storage, session);
+      await expect(manager.claim({ maxClaimsPerBatch })).rejects.toThrow(/batch|positive|integer/);
+      expect(facilitator.settle).not.toHaveBeenCalled();
+    },
+  );
 });

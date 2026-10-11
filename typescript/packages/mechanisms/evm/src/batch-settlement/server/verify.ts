@@ -16,13 +16,19 @@ import {
   isBatchSettlementVoucherPayload,
 } from "../types";
 import { BATCH_SETTLEMENT_SCHEME, voucherTypes } from "../constants";
+import { batchOperationFingerprint } from "../facilitator/operation";
 import type { ChannelConfig } from "../types";
 import { createNonce, getEvmChainId } from "../../utils";
 import { channelIdBindingError, computeChannelId, getBatchSettlementEip712Domain } from "../utils";
 import { validateChannelConfig } from "../facilitator/utils";
 import * as Errors from "../errors";
 import type { BatchSettlementEvmScheme } from "./scheme";
-import type { Channel, ChannelUpdateResult, PendingRequest } from "./storage";
+import {
+  isChannelAdmissionLive,
+  type Channel,
+  type ChannelUpdateResult,
+  type PendingRequest,
+} from "./storage";
 import { readExtraNumber, readExtraString, readExtraUintString } from "./utils";
 
 // Framework cleanup hooks clear pending reservations for normal failures
@@ -51,7 +57,7 @@ function pendingExpiresAt(maxTimeoutSeconds: number | undefined, now: number): n
  * @returns Whether the reservation exists and has not expired.
  */
 function isPendingLive(pending: PendingRequest | undefined, now: number): boolean {
-  return pending !== undefined && pending.expiresAt > now;
+  return isChannelAdmissionLive(pending, now);
 }
 
 /**
@@ -133,6 +139,17 @@ export async function handleBeforeVerify(
     }
 
     const channelId = raw.voucher.channelId;
+    const retained = scheme.readRetainedRefund(channelId);
+    const refundBinding = isZeroChargePayload
+      ? batchOperationFingerprint({ paymentPayload, requirements })
+      : undefined;
+    if (retained && (!isZeroChargePayload || retained.binding !== refundBinding)) {
+      return {
+        abort: true,
+        reason: Errors.ErrChannelBusy,
+        message: "An admitted refund remains unresolved; this changed request was not submitted",
+      };
+    }
     const now = Date.now();
     const pendingId = createNonce();
 
@@ -159,7 +176,15 @@ export async function handleBeforeVerify(
       channelId,
       pendingId,
       channelSnapshot,
+      ...(refundBinding !== undefined ? { refundBinding } : {}),
+      ...(retained ? { refundGeneration: retained.generation } : {}),
     });
+
+    if (retained) {
+      // Resume the original verified operation. Its old observation does not
+      // authorize a new effect; enrichment and facilitator admission remain exact.
+      return { skip: true, result: retained.verification };
+    }
 
     if (isBatchSettlementVoucherPayload(raw)) {
       const localResult = await verifyVoucherLocally(
@@ -399,7 +424,10 @@ export async function handleAfterVerify(
   }
 
   if (updateResult.status === "updated" && updateResult.channel) {
-    scheme.mergeRequestContext(paymentPayload, { reservationCommitted: true });
+    scheme.mergeRequestContext(paymentPayload, {
+      reservationCommitted: true,
+      ...(isRefundVoucher ? { refundVerification: structuredClone(result) } : {}),
+    });
     scheme.rememberChannelSnapshot(paymentPayload, updateResult.channel);
   }
 

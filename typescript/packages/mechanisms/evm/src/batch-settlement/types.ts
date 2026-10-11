@@ -148,6 +148,11 @@ export type BatchSettlementSettlePayload = {
 
 export type BatchSettlementEnrichedRefundPayload = BatchSettlementRefundPayload & {
   amount: string;
+  /**
+   * Admitted refund amount after `min(requested, refundable)`.
+   * Facilitator settlement uses this when the client amount was clamped.
+   */
+  effectiveAmount?: string;
   refundNonce: string;
   claims: BatchSettlementVoucherClaim[];
   refundAuthorizerSignature?: `0x${string}`;

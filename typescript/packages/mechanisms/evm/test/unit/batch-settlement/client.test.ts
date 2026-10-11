@@ -786,6 +786,14 @@ function makeSettle(signerAddress: string, extra: Record<string, unknown>): Sett
   };
 }
 
+function makeRefundSettle(
+  signerAddress: string,
+  extra: Record<string, unknown>,
+  amount: string,
+): SettleResponse {
+  return { ...makeSettle(signerAddress, extra), transaction: `0x${"ab".repeat(32)}`, amount };
+}
+
 function makeFailedSettle(
   signerAddress: string,
   extra: Record<string, unknown> = {},
@@ -1015,9 +1023,13 @@ describe("updateChannelFromSettle / schemeHooks", () => {
         },
       }),
       requirements,
-      settleResponse: makeSettle(signer.address, {
-        channelState: { channelId, balance: "9999" },
-      }),
+      settleResponse: makeRefundSettle(
+        signer.address,
+        {
+          channelState: { channelId, balance: "9999" },
+        },
+        "9000",
+      ),
     });
 
     expect(await storage.get(channelId.toLowerCase())).toBeUndefined();
@@ -1058,9 +1070,13 @@ describe("updateChannelFromSettle / schemeHooks", () => {
         amount: "2000",
       }),
       requirements,
-      settleResponse: makeSettle(signer.address, {
-        channelState: { channelId, balance: "0" },
-      }),
+      settleResponse: makeRefundSettle(
+        signer.address,
+        {
+          channelState: { channelId, balance: "0" },
+        },
+        "2000",
+      ),
     });
 
     const ctx = await storage.get(channelId.toLowerCase());
@@ -1112,23 +1128,32 @@ describe("updateChannelFromSettle / schemeHooks", () => {
     const hostileId = "0xabc12300000000000000000000000000000000000000000000000000000000ff";
 
     await storage.set(localId.toLowerCase(), { chargedCumulativeAmount: "1000", balance: "5000" });
-    await hooks.onPaymentResponse!({
-      paymentPayload: makePaymentPayload({
-        type: "refund",
-        channelConfig: config,
-        voucher: {
-          channelId: localId,
-          maxClaimableAmount: "1000",
-          signature: "0xdead",
-        },
+    await expect(
+      hooks.onPaymentResponse!({
+        paymentPayload: makePaymentPayload({
+          type: "refund",
+          channelConfig: config,
+          voucher: {
+            channelId: localId,
+            maxClaimableAmount: "1000",
+            signature: "0xdead",
+          },
+        }),
+        requirements,
+        settleResponse: makeRefundSettle(
+          signer.address,
+          {
+            channelState: { channelId: hostileId, balance: "9999" },
+          },
+          "4000",
+        ),
       }),
-      requirements,
-      settleResponse: makeSettle(signer.address, {
-        channelState: { channelId: hostileId, balance: "9999" },
-      }),
-    });
+    ).rejects.toThrow(/unknown/);
 
-    expect(await storage.get(localId.toLowerCase())).toBeUndefined();
+    expect(await storage.get(localId.toLowerCase())).toEqual({
+      chargedCumulativeAmount: "1000",
+      balance: "5000",
+    });
     expect(await storage.get(hostileId.toLowerCase())).toBeUndefined();
   });
 });
@@ -1600,7 +1625,7 @@ describe("BatchSettlementEvmScheme — refund()", () => {
     const { encodePaymentResponseHeader } = await import("@x402/core/http");
     const settle: SettleResponse = {
       success: true,
-      transaction: "0xtx",
+      transaction: `0x${"ab".repeat(32)}`,
       network: NETWORK,
       payer: privateKeyToAccount(PAYER_PRIVATE_KEY).address,
       ...(amount !== undefined ? { amount } : {}),
@@ -1680,14 +1705,17 @@ describe("BatchSettlementEvmScheme — refund()", () => {
     const fetchImpl = makeFetch([
       async () => probe402Response(),
       async () =>
-        refundSuccessResponse({
-          channelState: {
-            channelId,
-            balance: "0",
-            chargedCumulativeAmount: "500",
-            totalClaimed: "0",
+        refundSuccessResponse(
+          {
+            channelState: {
+              channelId,
+              balance: "0",
+              chargedCumulativeAmount: "500",
+              totalClaimed: "0",
+            },
           },
-        }),
+          "2000",
+        ),
     ]);
 
     const settle = await client.refund(REFUND_URL, { amount: "2000", fetch: fetchImpl });
@@ -1732,7 +1760,7 @@ describe("BatchSettlementEvmScheme — refund()", () => {
       async () => probe402Response(),
       async () =>
         new Response(null, { status: 402, headers: { "PAYMENT-REQUIRED": correctiveHeader } }),
-      async () => refundSuccessResponse({ channelState: { channelId, balance: "0" } }),
+      async () => refundSuccessResponse({ channelState: { channelId, balance: "0" } }, "9500"),
     ]);
     const processSpy = vi.spyOn(x402HTTPClient.prototype, "processPaymentResult");
 
@@ -1913,5 +1941,44 @@ describe("BatchSettlementEvmScheme — refund()", () => {
     await expect(client.refund(REFUND_URL, { fetch: fetchImpl })).rejects.toThrow(
       /missing PAYMENT-RESPONSE/,
     );
+  });
+});
+
+describe("211204 refund capacity receiving boundary", () => {
+  it.each([
+    { network: "eip155:1" },
+    { transaction: "0x123" },
+    { amount: undefined },
+    { amount: "0" },
+    { amount: "1.5" },
+    { amount: "-1" },
+    { errorReason: "settlement_pending" },
+  ])("keeps capacity unknown for a malformed success %j", async mutation => {
+    const signer = buildSigner(PAYER_PRIVATE_KEY);
+    const storage = new InMemoryClientChannelStorage();
+    const deps = makeDeps({ signer, storage });
+    const requirements = makeRequirements();
+    const config = buildChannelConfig(deps, requirements);
+    const channelId = computeChannelId(config);
+    const previous = { chargedCumulativeAmount: "1000", balance: "10000", totalClaimed: "0" };
+    await storage.set(channelId, previous);
+    const paymentPayload = makePaymentPayload({
+      type: "refund",
+      channelConfig: config,
+      voucher: { channelId, maxClaimableAmount: "1000", signature: "0xdead" },
+      amount: "2000",
+    });
+    const settleResponse = {
+      ...makeRefundSettle(signer.address, {}, "2000"),
+      ...mutation,
+    } as SettleResponse;
+    await expect(
+      createBatchSettlementClientHooks(deps).onPaymentResponse!({
+        paymentPayload,
+        requirements,
+        settleResponse,
+      }),
+    ).rejects.toThrow(/unknown/);
+    expect(await storage.get(channelId)).toEqual(previous);
   });
 });
