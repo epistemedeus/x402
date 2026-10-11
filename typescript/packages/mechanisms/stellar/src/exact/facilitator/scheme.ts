@@ -110,7 +110,7 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
    * @param options - Configuration options
    * @param options.rpcConfig - Optional RPC configuration with custom RPC URL
    * @param options.areFeesSponsored - Indicates if fees are sponsored (default: true)
-   * @param options.maxTransactionFeeStroops - Safety ceiling in stroops; verify rejects if the simulation-derived fee exceeds this (default: 50_000)
+   * @param options.maxTransactionFeeStroops - Safety ceiling in stroops; verify rejects if the simulation-derived fee exceeds this (default: 50_000). An explicit value authorizes that ceiling only and does not change the default.
    * @param options.inclusionFeeStroops - Inclusion fee bid in stroops for the settlement transaction and the fee bump, on top of the resource fee (default: 100).
    *   Mainnet often needs more than the minimum for Soroban transactions to be included.
    * @param options.selectSigner - Callback to select which signer to use (default: round-robin)
@@ -133,7 +133,7 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
       rpcConfig?: RpcConfig;
       /** Indicates if fees are sponsored (default: true) */
       areFeesSponsored?: boolean;
-      /** Safety ceiling in stroops; verify rejects if the simulation-derived fee exceeds this (default: 50_000) */
+      /** Safety ceiling in stroops; verify rejects if the simulation-derived fee exceeds this (default: 50_000). An explicit value does not change the default. */
       maxTransactionFeeStroops?: number;
       /** Inclusion fee bid in stroops for the settlement transaction and the fee bump (default: 100) */
       inclusionFeeStroops?: number;
@@ -534,7 +534,8 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
         };
       }
 
-      // Step 9: Validate simulation events for expected transfer only.
+      // Step 9: Validate simulation events. Exactly one asset transfer is required.
+      // One matching OpenZeppelin spending_limit_enforced event may accompany it.
       const eventValidation = this.validateSimulationEvents(
         simResponse.events,
         fromAddress,
@@ -617,6 +618,8 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
    * Ensures there is exactly one token transfer event, the transfer matches the
    * expected sender, recipient, amount, and asset (contract address), and the
    * facilitator address is not involved in the transfer.
+   * A single OpenZeppelin `spending_limit_enforced` event is allowed only when
+   * its smart account, amount, and transfer context match that transfer.
    *
    * @param events - The array of DiagnosticEvent objects from the simulation
    * @param fromAddress - The payer's address
@@ -639,6 +642,7 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
       to: string;
       amount: bigint;
     }> = [];
+    let acceptedSpendingLimitEnforced = false;
 
     // Parse events into
     for (const diagnosticEvent of events) {
@@ -652,25 +656,37 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
 
         const body = event.body().v0();
         const topics = body.topics();
+        const symbol = readScSymbol(topics[0]);
 
-        // Check if this is a transfer event (first topic is "transfer" symbol)
-        if (topics.length < 3) {
-          return invalidVerifyResponse(
-            "invalid_exact_stellar_payload_event_not_transfer",
+        // OpenZeppelin SpendingLimitEnforced is two topics and is not a balance change.
+        // It is tolerated only from a contract other than the asset. The same symbol
+        // from the asset contract stays on the asset-event path below.
+        // Any other short event, including sibling policy events, stays rejected.
+        if (
+          symbol === SPENDING_LIMIT_ENFORCED_SYMBOL &&
+          contractEventAddress(event) !== expectedAsset
+        ) {
+          const rejection = spendingLimitEnforcedRejection(
+            event,
+            topics,
+            body.data(),
             fromAddress,
+            toAddress,
+            expectedAmount,
+            expectedAsset,
           );
+          if (rejection) {
+            return rejection;
+          }
+          if (acceptedSpendingLimitEnforced) {
+            return invalidVerifyResponse(CONTRADICTORY_AUTHORIZATION_REASON, fromAddress);
+          }
+          acceptedSpendingLimitEnforced = true;
+          continue;
         }
 
-        const topicType = topics[0].switch().name;
-        if (topicType !== "scvSymbol") {
-          return invalidVerifyResponse(
-            "invalid_exact_stellar_payload_event_not_transfer",
-            fromAddress,
-          );
-        }
-
-        const symbol = topics[0].sym().toString();
-        if (symbol !== "transfer") {
+        // transfer, mint, burn, and clawback from any contract stay on this path.
+        if (topics.length < 3 || symbol !== "transfer") {
           return invalidVerifyResponse(
             "invalid_exact_stellar_payload_event_not_transfer",
             fromAddress,
@@ -819,4 +835,313 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
 
     return undefined;
   }
+}
+
+const SPENDING_LIMIT_ENFORCED_SYMBOL = "spending_limit_enforced";
+const MALFORMED_POLICY_EVENT_REASON = "invalid_exact_stellar_payload_malformed_policy_event";
+const CONTRADICTORY_AUTHORIZATION_REASON =
+  "invalid_exact_stellar_payload_contradictory_authorization";
+const POLICY_DATA_KEYS = ["amount", "context", "context_rule_id", "total_spent_in_period"];
+const TRANSFER_CONTEXT_KEYS = ["args", "contract", "fn_name"];
+
+/**
+ * Returns the contract address that published an event.
+ *
+ * @param event - Contract event from a diagnostic event
+ * @returns the contract address, or undefined when the event has no contract id
+ */
+function contractEventAddress(event: xdr.ContractEvent): string | undefined {
+  const contractIdHash = event.contractId();
+  if (!contractIdHash) {
+    return undefined;
+  }
+  return Address.fromScAddress(xdr.ScAddress.scAddressTypeContract(contractIdHash)).toString();
+}
+
+/**
+ * Reads a Soroban symbol.
+ *
+ * @param val - ScVal that may be a symbol
+ * @returns the symbol text, or undefined when the value is not a symbol
+ */
+function readScSymbol(val: xdr.ScVal | undefined): string | undefined {
+  if (!val || val.switch().name !== "scvSymbol") {
+    return undefined;
+  }
+  return val.sym().toString();
+}
+
+/**
+ * Reads an address ScVal as a string.
+ *
+ * @param val - ScVal that may be an address
+ * @returns the address string, or undefined when the value is not an address
+ */
+function readScAddress(val: xdr.ScVal): string | undefined {
+  if (val.switch().name !== "scvAddress") {
+    return undefined;
+  }
+  try {
+    const native = scValToNative(val);
+    return typeof native === "string" ? native : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reads an i128 ScVal.
+ *
+ * @param val - ScVal that may be an i128
+ * @returns the bigint, or undefined when the value is not an i128
+ */
+function readScI128(val: xdr.ScVal): bigint | undefined {
+  if (val.switch().name !== "scvI128") {
+    return undefined;
+  }
+  try {
+    const native = scValToNative(val);
+    return typeof native === "bigint" ? native : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reads a u32 ScVal.
+ *
+ * @param val - ScVal that may be a u32
+ * @returns the number, or undefined when the value is not a u32
+ */
+function readScU32(val: xdr.ScVal): number | undefined {
+  if (val.switch().name !== "scvU32") {
+    return undefined;
+  }
+  return val.u32();
+}
+
+/**
+ * Reads a Soroban vector.
+ *
+ * @param val - ScVal that may be a vector
+ * @returns the elements, or undefined when the value is not a vector
+ */
+function readScVec(val: xdr.ScVal): xdr.ScVal[] | undefined {
+  if (val.switch().name !== "scvVec") {
+    return undefined;
+  }
+  const items = val.vec();
+  return items ? [...items] : undefined;
+}
+
+/**
+ * Reads a symbol-keyed Soroban map.
+ *
+ * @param val - ScVal that may be a map
+ * @returns entries keyed by symbol, or undefined when a key is not a unique symbol
+ */
+function readSymbolMap(val: xdr.ScVal): Map<string, xdr.ScVal> | undefined {
+  if (val.switch().name !== "scvMap") {
+    return undefined;
+  }
+  const entries = val.map();
+  if (!entries) {
+    return undefined;
+  }
+  const out = new Map<string, xdr.ScVal>();
+  for (const entry of entries) {
+    const name = readScSymbol(entry.key());
+    if (name === undefined || out.has(name)) {
+      return undefined;
+    }
+    out.set(name, entry.val());
+  }
+  return out;
+}
+
+interface SpendingLimitFields {
+  context: xdr.ScVal;
+  contextRuleId: xdr.ScVal;
+  amount: xdr.ScVal;
+  totalSpentInPeriod: xdr.ScVal;
+}
+
+/**
+ * Reads OpenZeppelin SpendingLimitEnforced data.
+ * soroban-sdk 26.1.0 defaults `#[contractevent]` data to a map. The documented
+ * list is the same four fields in declaration order.
+ *
+ * @param data - Event data ScVal
+ * @returns the four fields, or undefined when the value is neither accepted shape
+ */
+function readSpendingLimitFields(data: xdr.ScVal): SpendingLimitFields | undefined {
+  const map = readSymbolMap(data);
+  if (map) {
+    if (map.size !== POLICY_DATA_KEYS.length) {
+      return undefined;
+    }
+    const context = map.get("context");
+    const contextRuleId = map.get("context_rule_id");
+    const amount = map.get("amount");
+    const totalSpentInPeriod = map.get("total_spent_in_period");
+    if (!context || !contextRuleId || !amount || !totalSpentInPeriod) {
+      return undefined;
+    }
+    return { context, contextRuleId, amount, totalSpentInPeriod };
+  }
+
+  const items = readScVec(data);
+  if (!items || items.length !== 4) {
+    return undefined;
+  }
+  return {
+    context: items[0],
+    contextRuleId: items[1],
+    amount: items[2],
+    totalSpentInPeriod: items[3],
+  };
+}
+
+/**
+ * Checks that a policy context is the Contract variant of this SEP-41 transfer.
+ * Context is the soroban-sdk 26.1.0 contracttype encoding: a two-element vector
+ * of the variant symbol and a map of contract, fn_name, and args.
+ *
+ * @param context - Context ScVal from the policy event
+ * @param asset - Expected token contract address
+ * @param fromAddress - Expected payer
+ * @param toAddress - Expected recipient
+ * @param expectedAmount - Expected transfer amount
+ * @returns ok, malformed when the encoding is not a contract context, or contradictory when it names a different call
+ */
+function transferContextStatus(
+  context: xdr.ScVal,
+  asset: string,
+  fromAddress: string,
+  toAddress: string,
+  expectedAmount: bigint,
+): "ok" | "malformed" | "contradictory" {
+  const items = readScVec(context);
+  if (!items || items.length !== 2) {
+    return "malformed";
+  }
+  const discriminant = readScSymbol(items[0]);
+  if (discriminant === undefined) {
+    return "malformed";
+  }
+  if (discriminant !== "Contract") {
+    return "contradictory";
+  }
+  const fields = readSymbolMap(items[1]);
+  if (!fields || fields.size !== TRANSFER_CONTEXT_KEYS.length) {
+    return "malformed";
+  }
+  const contractVal = fields.get("contract");
+  const fnVal = fields.get("fn_name");
+  const argsVal = fields.get("args");
+  if (!contractVal || !fnVal || !argsVal) {
+    return "malformed";
+  }
+  const contract = readScAddress(contractVal);
+  if (contract === undefined) {
+    return "malformed";
+  }
+  if (contract !== asset) {
+    return "contradictory";
+  }
+  const fnName = readScSymbol(fnVal);
+  if (fnName === undefined) {
+    return "malformed";
+  }
+  if (fnName !== "transfer") {
+    return "contradictory";
+  }
+  const args = readScVec(argsVal);
+  if (!args) {
+    return "malformed";
+  }
+  if (args.length !== 3) {
+    return "contradictory";
+  }
+  const argFrom = readScAddress(args[0]);
+  const argTo = readScAddress(args[1]);
+  const argAmount = readScI128(args[2]);
+  if (argFrom === undefined || argTo === undefined || argAmount === undefined) {
+    return "malformed";
+  }
+  if (argFrom !== fromAddress || argTo !== toAddress || argAmount !== expectedAmount) {
+    return "contradictory";
+  }
+  return "ok";
+}
+
+/**
+ * Accepts one OpenZeppelin spending_limit_enforced event that authorizes this transfer.
+ * The caller has already excluded an event published by the asset contract.
+ * The event does not move funds. enforce() publishes it only for a positive SEP-41
+ * transfer, with the smart account as the topic and that transfer's i128 amount in the data.
+ * Sibling policy events are not authorization of this payment.
+ *
+ * @param event - Contract event being inspected
+ * @param topics - Event topics, whose first entry is spending_limit_enforced
+ * @param data - Event data
+ * @param fromAddress - Payer from the invoke arguments
+ * @param toAddress - Expected recipient
+ * @param expectedAmount - Expected transfer amount
+ * @param expectedAsset - Expected token contract
+ * @returns undefined when the event matches, otherwise a malformed or contradictory verify response
+ */
+function spendingLimitEnforcedRejection(
+  event: xdr.ContractEvent,
+  topics: xdr.ScVal[],
+  data: xdr.ScVal,
+  fromAddress: string,
+  toAddress: string,
+  expectedAmount: bigint,
+  expectedAsset: string,
+): VerifyResponse | undefined {
+  if (topics.length !== 2) {
+    return invalidVerifyResponse(MALFORMED_POLICY_EVENT_REASON, fromAddress);
+  }
+  const smartAccount = readScAddress(topics[1]);
+  if (smartAccount === undefined) {
+    return invalidVerifyResponse(MALFORMED_POLICY_EVENT_REASON, fromAddress);
+  }
+  if (smartAccount !== fromAddress) {
+    return invalidVerifyResponse(CONTRADICTORY_AUTHORIZATION_REASON, fromAddress);
+  }
+  if (!event.contractId()) {
+    return invalidVerifyResponse(MALFORMED_POLICY_EVENT_REASON, fromAddress);
+  }
+
+  const fields = readSpendingLimitFields(data);
+  if (!fields) {
+    return invalidVerifyResponse(MALFORMED_POLICY_EVENT_REASON, fromAddress);
+  }
+  const contextRuleId = readScU32(fields.contextRuleId);
+  const amount = readScI128(fields.amount);
+  const totalSpentInPeriod = readScI128(fields.totalSpentInPeriod);
+  if (contextRuleId === undefined || amount === undefined || totalSpentInPeriod === undefined) {
+    return invalidVerifyResponse(MALFORMED_POLICY_EVENT_REASON, fromAddress);
+  }
+  if (amount !== expectedAmount || totalSpentInPeriod < amount) {
+    return invalidVerifyResponse(CONTRADICTORY_AUTHORIZATION_REASON, fromAddress);
+  }
+
+  const contextStatus = transferContextStatus(
+    fields.context,
+    expectedAsset,
+    fromAddress,
+    toAddress,
+    expectedAmount,
+  );
+  if (contextStatus === "ok") {
+    return undefined;
+  }
+  return invalidVerifyResponse(
+    contextStatus === "malformed"
+      ? MALFORMED_POLICY_EVENT_REASON
+      : CONTRADICTORY_AUTHORIZATION_REASON,
+    fromAddress,
+  );
 }
