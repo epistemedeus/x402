@@ -274,7 +274,7 @@ class BazaarExtension:
         Example:
             ```python
             from x402.http import HTTPFacilitatorClientSync
-            from x402.extensions.bazaar import with_bazaar
+            from x402.extensions.bazaar import with_bazaar, ListDiscoveryResourcesParams
 
             client = with_bazaar(HTTPFacilitatorClientSync())
             resources = client.extensions.bazaar.list_resources(
