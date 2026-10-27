@@ -1,6 +1,7 @@
 package svm
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
@@ -12,6 +13,9 @@ import (
 	bin "github.com/gagliardetto/binary"
 	solana "github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/programs/token"
+	"github.com/gagliardetto/solana-go/rpc"
+
+	"github.com/x402-foundation/x402/go/v2/types"
 )
 
 var (
@@ -21,15 +25,15 @@ var (
 
 // NormalizeNetwork converts V1 network names to CAIP-2 format
 func NormalizeNetwork(network string) (string, error) {
-	// If it's already CAIP-2 format (contains ":"), validate it's supported
 	if strings.Contains(network, ":") {
-		if _, ok := NetworkConfigs[network]; ok {
+		switch network {
+		case SolanaMainnetCAIP2, SolanaDevnetCAIP2, SolanaTestnetCAIP2:
 			return network, nil
+		default:
+			return "", fmt.Errorf("unsupported Solana network: %s", network)
 		}
-		return "", fmt.Errorf("unsupported Solana network: %s", network)
 	}
 
-	// Otherwise, it's a V1 network name, convert to CAIP-2
 	caip2Network, ok := V1ToV2NetworkMap[network]
 	if !ok {
 		return "", fmt.Errorf("unsupported Solana network: %s", network)
@@ -38,9 +42,8 @@ func NormalizeNetwork(network string) (string, error) {
 	return caip2Network, nil
 }
 
-// GetNetworkConfig returns the configuration for a network
+// GetNetworkConfig returns transport endpoints for a supported Solana network.
 func GetNetworkConfig(network string) (*NetworkConfig, error) {
-	// Normalize to CAIP-2
 	caip2Network, err := NormalizeNetwork(network)
 	if err != nil {
 		return nil, err
@@ -48,9 +51,8 @@ func GetNetworkConfig(network string) (*NetworkConfig, error) {
 
 	config, ok := NetworkConfigs[caip2Network]
 	if !ok {
-		return nil, fmt.Errorf("network configuration not found: %s", network)
+		return nil, fmt.Errorf("no configuration for network: %s", network)
 	}
-
 	return &config, nil
 }
 
@@ -58,11 +60,6 @@ func GetNetworkConfig(network string) (*NetworkConfig, error) {
 func GetAssetInfo(network string, assetSymbolOrAddress string) (*AssetInfo, error) {
 	if found := FindDefaultAsset(assetSymbolOrAddress, network); found != nil {
 		return defaultAssetToAssetInfo(found), nil
-	}
-
-	config, err := GetNetworkConfig(network)
-	if err != nil {
-		return nil, err
 	}
 
 	// Check if it's a valid Solana address (mint address)
@@ -75,8 +72,11 @@ func GetAssetInfo(network string, assetSymbolOrAddress string) (*AssetInfo, erro
 		}, nil
 	}
 
-	// Default to the network's default asset
-	return &config.DefaultAsset, nil
+	info, err := GetDefaultAsset(network, "")
+	if err != nil {
+		return nil, err
+	}
+	return defaultAssetToAssetInfo(info), nil
 }
 
 // stablecoinNetworkKey maps a network identifier to its mint lookup key.
@@ -278,6 +278,138 @@ func DecodeTransaction(base64Tx string) (*solana.Transaction, error) {
 	return tx, nil
 }
 
+// ErrUnsupportedTransactionVersion is the verify/settle reason returned when a
+// client-supplied transaction uses a message version the SVM schemes do not
+// accept. Every scheme shares this code so operators see one reason across
+// exact, upto and payment-channels regardless of which verifier rejected it.
+const ErrUnsupportedTransactionVersion = "unsupported_transaction_version"
+
+// ExtraTransactionVersions is the PaymentRequirements.Extra key (copied by the
+// server from the facilitator's /supported extra) that lists the transaction
+// message versions the facilitator accepts, in the Wallet Standard
+// supportedTransactionVersions vocabulary ("legacy", 0, 1).
+const ExtraTransactionVersions = "transactionVersions"
+
+// AdvertisedTransactionVersions is the value facilitators publish as
+// extra.transactionVersions in /supported. Only version 0 is advertised:
+// legacy messages are still accepted for backward compatibility (see
+// IsAcceptedTransactionVersion) but are deprecated and never offered to
+// clients, and version 1 (SIMD-0385) is not modelled by this SDK yet.
+var AdvertisedTransactionVersions = []int{0}
+
+// ClientSupportedTransactionVersions lists message versions this client can
+// construct. Negotiation selects the highest value shared with the
+// facilitator's advertised set.
+var ClientSupportedTransactionVersions = []int{0}
+
+// IsAcceptedTransactionVersion reports whether a decoded message version is one
+// the SVM verifiers know how to police. This is an allowlist of legacy and v0,
+// not a comparison against a maximum: every acceptance check derives its
+// sponsorship policy from version-specific structure (compute budget arrives as
+// ComputeBudget instructions on legacy and v0, but as an inline message config
+// on transaction v1), so an unmodelled version must be rejected before any
+// instruction-scanning check can pass vacuously.
+func IsAcceptedTransactionVersion(version solana.MessageVersion) bool {
+	return version == solana.MessageVersionLegacy || version == solana.MessageVersionV0
+}
+
+// ResolveTransactionVersion picks the message version a client must build from
+// requirements.Extra["transactionVersions"]. It selects the highest version
+// shared by the facilitator advertisement and this client's supported-version
+// set. An absent field means the facilitator predates advertisement and
+// accepts v0.
+func ResolveTransactionVersion(extra map[string]interface{}) (solana.MessageVersion, error) {
+	selected, err := selectTransactionVersion(extra)
+	if err != nil {
+		return 0, err
+	}
+	return messageVersionForWire(selected)
+}
+
+// messageVersionForWire maps a wire version number to solana-go's
+// MessageVersion. The two do not line up (MessageVersionLegacy is 0 and
+// MessageVersionV0 is 1), and SetVersion panics on a value solana-go does not
+// model, so every buildable version is mapped explicitly.
+func messageVersionForWire(version int) (solana.MessageVersion, error) {
+	switch version {
+	case 0:
+		return solana.MessageVersionV0, nil
+	default:
+		return 0, fmt.Errorf("%s: this client cannot build transaction version %d", ErrUnsupportedTransactionVersion, version)
+	}
+}
+
+// selectTransactionVersion returns the highest wire version shared by the
+// advertisement in extra and ClientSupportedTransactionVersions.
+func selectTransactionVersion(extra map[string]interface{}) (int, error) {
+	raw := interface{}([]int{0})
+	if extra != nil {
+		if value, ok := extra[ExtraTransactionVersions]; ok {
+			raw = value
+		}
+	}
+	// The field holds only the integers 0 and 1. Any other entry, including
+	// Wallet Standard's "legacy" or a stringified version, invalidates the
+	// whole field rather than being skipped.
+	var entries []interface{}
+	switch typed := raw.(type) {
+	case []interface{}:
+		entries = typed
+	// Typed slices appear when the requirements were built in-process
+	// rather than decoded from JSON.
+	case []int:
+		for _, v := range typed {
+			entries = append(entries, v)
+		}
+	case []float64:
+		for _, v := range typed {
+			entries = append(entries, v)
+		}
+	default:
+		return 0, fmt.Errorf("%s: transactionVersions must be an array, got %T", ErrUnsupportedTransactionVersion, raw)
+	}
+	advertised := make([]int, 0, len(entries))
+	for _, entry := range entries {
+		version, ok := transactionVersionEntry(entry)
+		if !ok {
+			return 0, fmt.Errorf("%s: transactionVersions entries must be the integers 0 or 1, got %v (%T)", ErrUnsupportedTransactionVersion, entry, entry)
+		}
+		advertised = append(advertised, version)
+	}
+	selected := -1
+	for _, supported := range ClientSupportedTransactionVersions {
+		for _, offered := range advertised {
+			if supported == offered && supported > selected {
+				selected = supported
+			}
+		}
+	}
+	if selected >= 0 {
+		return selected, nil
+	}
+	return 0, fmt.Errorf("%s: facilitator accepts none of the transaction versions this client can build: %v", ErrUnsupportedTransactionVersion, raw)
+}
+
+// transactionVersionEntry reports whether entry is the integer 0 or 1. JSON
+// decoding yields float64, so an integral float64 is accepted.
+func transactionVersionEntry(entry interface{}) (int, bool) {
+	switch v := entry.(type) {
+	case float64:
+		if v == 0 || v == 1 {
+			return int(v), true
+		}
+	case int:
+		if v == 0 || v == 1 {
+			return v, true
+		}
+	case int64:
+		if v == 0 || v == 1 {
+			return int(v), true
+		}
+	}
+	return 0, false
+}
+
 // GetTokenPayerFromTransaction extracts the token payer (owner) address from a transaction
 // This looks for the TransferChecked instruction and returns the owner/authority address
 func GetTokenPayerFromTransaction(tx *solana.Transaction) (string, error) {
@@ -287,7 +419,10 @@ func GetTokenPayerFromTransaction(tx *solana.Transaction) (string, error) {
 
 	// Iterate through instructions to find TransferChecked
 	for _, inst := range tx.Message.Instructions {
-		programID := tx.Message.AccountKeys[inst.ProgramIDIndex]
+		programID, err := tx.Message.Program(inst.ProgramIDIndex)
+		if err != nil {
+			continue
+		}
 
 		// Check if this is a token program instruction
 		if programID == solana.TokenProgramID || programID == solana.Token2022ProgramID {
@@ -313,6 +448,76 @@ func GetTokenPayerFromTransaction(tx *solana.Transaction) (string, error) {
 	}
 
 	return "", fmt.Errorf("no TransferChecked instruction found in transaction")
+}
+
+// ResolveBlockhash prefers extra.recentBlockhash. A missing or malformed hint
+// is fetched from rpc at finalized commitment.
+func ResolveBlockhash(ctx context.Context, rpcClient *rpc.Client, requirements types.PaymentRequirements) (solana.Hash, error) {
+	if hint, ok := requirements.Extra["recentBlockhash"].(string); ok && hint != "" {
+		if blockhash, err := solana.HashFromBase58(hint); err == nil {
+			return blockhash, nil
+		}
+	}
+	latest, err := rpcClient.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+	if err != nil {
+		return solana.Hash{}, fmt.Errorf("failed to get latest blockhash: %w", err)
+	}
+	return latest.Value.Blockhash, nil
+}
+
+// ResolveOpenSlot prefers extra.recentSlot. A missing or malformed hint is
+// fetched from rpc at finalized commitment.
+func ResolveOpenSlot(ctx context.Context, rpcClient *rpc.Client, requirements types.PaymentRequirements) (uint64, error) {
+	if slot, ok := parseHintUint64(requirements.Extra["recentSlot"]); ok {
+		return slot, nil
+	}
+	slot, err := rpcClient.GetSlot(ctx, rpc.CommitmentFinalized)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get slot: %w", err)
+	}
+	return slot, nil
+}
+
+func parseHintUint64(value any) (uint64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		if typed < 0 || typed != float64(uint64(typed)) {
+			return 0, false
+		}
+		return uint64(typed), true
+	case int:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint64(typed), true
+	case int64:
+		if typed < 0 {
+			return 0, false
+		}
+		return uint64(typed), true
+	case uint64:
+		return typed, true
+	case string:
+		parsed, err := strconv.ParseUint(typed, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+// CreateRPCClient dials rpcURL, or the network's default endpoint when rpcURL is empty.
+func CreateRPCClient(network, rpcURL string) (*rpc.Client, error) {
+	if rpcURL != "" {
+		return rpc.New(rpcURL), nil
+	}
+	config, err := GetNetworkConfig(network)
+	if err != nil {
+		return nil, err
+	}
+	return rpc.New(config.RPCURL), nil
 }
 
 // EncodeTransaction encodes a Solana transaction to base64

@@ -1,10 +1,16 @@
-import { createHash } from "node:crypto";
+import { sha256 } from "@noble/hashes/sha256";
+import {
+  ErrInvalidPayloadTransaction,
+  ErrUnsupportedTransactionVersion,
+} from "./exact/facilitator/errors";
 import {
   isAddress,
   getBase58Encoder,
+  getBase64Decoder,
   getBase64Encoder,
   getTransactionDecoder,
   getCompiledTransactionMessageDecoder,
+  getInstructionsFromCompiledTransactionMessage,
   type Blockhash,
   type Transaction,
   createSolanaRpc,
@@ -20,8 +26,11 @@ import {
 } from "@solana/kit";
 import { TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
 import { TOKEN_2022_PROGRAM_ADDRESS } from "@solana-program/token-2022";
-import type { Network, PaymentRequirements } from "@x402/core/types";
+import type { PendingSettlementStore } from "@x402/core/facilitator";
+import type { Network, PaymentRequirements, SettleResponse } from "@x402/core/types";
 import {
+  ACCEPTED_TRANSACTION_VERSIONS,
+  CLIENT_SUPPORTED_TRANSACTION_VERSIONS,
   SVM_ADDRESS_REGEX,
   DEVNET_RPC_URL,
   TESTNET_RPC_URL,
@@ -33,6 +42,7 @@ import {
 } from "./constants";
 import { DEFAULT_ASSETS, findDefaultAsset, getDefaultAsset } from "./defaultAssets";
 import type { ExactSvmPayloadV1 } from "./types";
+import { SLOT_COMMITMENT } from "./payment-channels/commitments";
 
 export { normalizeNetwork } from "./constants";
 
@@ -61,7 +71,7 @@ export function validateSvmAddress(address: string): boolean {
  * @returns Base64-encoded SHA-256 hash of the transaction message bytes
  */
 export function transactionMessageHash(transaction: Transaction): string {
-  return createHash("sha256").update(Buffer.from(transaction.messageBytes)).digest("base64");
+  return getBase64Decoder().decode(sha256(Uint8Array.from(transaction.messageBytes)));
 }
 
 /**
@@ -78,8 +88,104 @@ export function decodeTransactionFromPayload(svmPayload: ExactSvmPayloadV1): Tra
     return transactionDecoder.decode(transactionBytes);
   } catch (error) {
     console.error("Error decoding transaction:", error);
-    throw new Error("invalid_exact_svm_payload_transaction");
+    throw new Error(ErrInvalidPayloadTransaction);
   }
+}
+
+/**
+ * Read a wire transaction's message version from its raw bytes, without
+ * trusting an SDK decoder. Legacy and version 0 transactions start with the
+ * compact-u16 signature count (always below 0x80 within the size limit), then
+ * the signatures, then the message, whose first byte carries the version
+ * prefix when its high bit is set. Version 1 (SIMD-0385) puts the message
+ * first, so its first byte is the version byte itself (`0x81`).
+ *
+ * Verifiers call this before decoding so a newer format is reported as
+ * `unsupported_transaction_version` whether the installed decoder rejects it,
+ * misreads it, or decodes it.
+ *
+ * @param transactionBase64 - The base64-encoded wire transaction
+ * @returns The message version, or undefined when the bytes are too short to tell
+ */
+export function peekWireTransactionVersion(
+  transactionBase64: string,
+): number | "legacy" | undefined {
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(getBase64Encoder().encode(transactionBase64));
+  } catch {
+    return undefined;
+  }
+  if (bytes.length === 0) return undefined;
+  if (bytes[0] & 0x80) return bytes[0] & 0x7f;
+  const prefixOffset = 1 + 64 * bytes[0];
+  if (prefixOffset >= bytes.length) return undefined;
+  const prefix = bytes[prefixOffset];
+  return prefix & 0x80 ? prefix & 0x7f : "legacy";
+}
+
+/**
+ * Whether a decoded transaction message's version is one the SVM verifiers
+ * model. Verifiers call this before any signature or instruction check so a
+ * version whose compute budget lives elsewhere (e.g. transaction v1's
+ * `message.config`) cannot pass the instruction-scanning checks vacuously.
+ *
+ * @param version - The `version` field of a compiled or decompiled transaction message
+ * @returns Whether the version is legacy or 0
+ */
+export function isAcceptedTransactionVersion(version: number | string): boolean {
+  return ACCEPTED_TRANSACTION_VERSIONS.includes(version);
+}
+
+/**
+ * Pick the transaction message version a client builds from the versions the
+ * facilitator advertised in `extra.transactionVersions`. This client only
+ * builds version 0 today. Negotiation selects the highest version shared by
+ * the facilitator advertisement and this client's supported-version set.
+ *
+ * @param extra - The `extra` field of the payment requirements
+ * @returns The highest mutually supported transaction message version
+ * @throws Error prefixed with `unsupported_transaction_version` when the sets do not intersect
+ */
+export function resolveTransactionVersion(extra: Record<string, unknown> | undefined): 0 {
+  const advertised = extra && "transactionVersions" in extra ? extra.transactionVersions : [0];
+  if (!Array.isArray(advertised)) {
+    throw new Error(`${ErrUnsupportedTransactionVersion}: transactionVersions must be an array`);
+  }
+  // The field holds only the integers 0 and 1. Any other entry, including
+  // Wallet Standard's "legacy" or a stringified version, invalidates the
+  // whole field rather than being skipped.
+  const invalidIndex = advertised.findIndex(version => version !== 0 && version !== 1);
+  if (invalidIndex !== -1) {
+    throw new Error(
+      `${ErrUnsupportedTransactionVersion}: transactionVersions entries must be the integers 0 or 1 (got ${JSON.stringify(advertised[invalidIndex]) ?? "undefined"})`,
+    );
+  }
+  const selected = selectHighestMutuallySupportedTransactionVersion(
+    advertised,
+    CLIENT_SUPPORTED_TRANSACTION_VERSIONS,
+  );
+  if (selected !== undefined) {
+    return selected as 0;
+  }
+  throw new Error(
+    `${ErrUnsupportedTransactionVersion}: facilitator accepts none of the transaction versions this client can build (advertised ${JSON.stringify(advertised)})`,
+  );
+}
+
+/**
+ * Select the maximum numeric version present in both version sets.
+ *
+ * @param advertised - Versions accepted by the facilitator
+ * @param supported - Versions the client can construct
+ * @returns Highest mutual version, or undefined when the sets do not intersect
+ */
+export function selectHighestMutuallySupportedTransactionVersion(
+  advertised: readonly unknown[],
+  supported: readonly number[],
+): number | undefined {
+  const mutual = supported.filter(version => advertised.includes(version));
+  return mutual.length > 0 ? Math.max(...mutual) : undefined;
 }
 
 /**
@@ -90,23 +196,20 @@ export function decodeTransactionFromPayload(svmPayload: ExactSvmPayloadV1): Tra
  */
 export function getTokenPayerFromTransaction(transaction: Transaction): string {
   const compiled = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
-  const staticAccounts = compiled.staticAccounts ?? [];
-  const instructions = compiled.instructions ?? [];
+  const instructions = getInstructionsFromCompiledTransactionMessage(compiled);
 
   for (const ix of instructions) {
-    const programIndex = ix.programAddressIndex;
-    const programAddress = staticAccounts[programIndex].toString();
+    const programAddress = ix.programAddress.toString();
 
     // Check if this is a token program instruction
     if (
       programAddress === TOKEN_PROGRAM_ADDRESS.toString() ||
       programAddress === TOKEN_2022_PROGRAM_ADDRESS.toString()
     ) {
-      const accountIndices: number[] = ix.accountIndices ?? [];
+      const accounts = ix.accounts ?? [];
       // TransferChecked account order: [source, mint, destination, owner, ...]
-      if (accountIndices.length >= 4) {
-        const ownerIndex = accountIndices[3];
-        const ownerAddress = staticAccounts[ownerIndex].toString();
+      if (accounts.length >= 4) {
+        const ownerAddress = accounts[3].address.toString();
         if (ownerAddress) return ownerAddress;
       }
     }
@@ -197,9 +300,9 @@ export async function resolveBlockhash(
  *
  * Prefers a server-provided slot carried in the 402 challenge
  * (`extra.recentSlot`) so the client needn't make its own RPC round-trip. Falls
- * back to `rpc.getSlot()` when the challenge omits it or contains a malformed
- * value. Default RPC commitment (`finalized`) keeps `openSlot <= clock.slot`
- * true when the open lands.
+ * back to `rpc.getSlot({ commitment: SLOT_COMMITMENT })` when the challenge
+ * omits it or contains a malformed value. Finalized commitment keeps
+ * `openSlot <= clock.slot` true when the open lands, matching the facilitator.
  *
  * @param rpc - RPC client used for the fallback fetch
  * @param requirements - The payment requirements (challenge) being paid
@@ -234,7 +337,7 @@ export async function resolveOpenSlot(
     }
   }
 
-  return await rpc.getSlot().send();
+  return await rpc.getSlot({ commitment: SLOT_COMMITMENT }).send();
 }
 
 /**
@@ -310,6 +413,84 @@ export function getStablecoinTokenProgram(currency: string, network: Network): s
   } catch {
     return TOKEN_PROGRAM_ADDRESS.toString();
   }
+}
+
+/**
+ * Thrown by a {@link PendingSettlementStore}-aware confirmation wait (e.g.
+ * `FacilitatorSvmSigner.confirmTransaction`) when the transaction reached the
+ * chain and failed there — a definite onchain rejection, not a
+ * confirmation-wait timeout whose outcome is still unknown. Callers must
+ * treat this as terminal: release any dedup/pending-settlement lock and
+ * report a failure instead of `settlement_pending`. Any other confirmation
+ * error (timeout or otherwise) is treated conservatively as non-terminal,
+ * since a fresh broadcast while the original might still land risks a
+ * double-spend.
+ */
+export class TransactionOnchainFailureError extends Error {
+  /**
+   * Create the error for a transaction that reached the chain and failed there.
+   *
+   * @param message - Description of the onchain failure, e.g. the decoded transaction error
+   */
+  constructor(message: string) {
+    super(message);
+    this.name = "TransactionOnchainFailureError";
+  }
+}
+
+/**
+ * Persists `signature` under `key` in `store` so a subsequent settle attempt
+ * for the same payload can reconcile against it instead of re-broadcasting,
+ * then returns the `settlement_pending` response carrying `error`'s message.
+ *
+ * If the store write itself fails, a later retry has no record to reconcile
+ * against — returning `settlement_pending` regardless would let it blindly
+ * re-verify/re-broadcast and risk a double-send. In that case this instead
+ * returns a terminal failure (`terminalReason`), preserving `signature` for
+ * manual reconciliation.
+ *
+ * @param store - The pending-settlement store to update
+ * @param key - Deterministic key for this payload (e.g. a signature or channel id)
+ * @param signature - The broadcast signature to persist and report
+ * @param payer - The payer address
+ * @param network - Network the transaction was broadcast to
+ * @param pendingReason - Error reason to report when the store write succeeds
+ * @param terminalReason - Error reason to report when the store write fails
+ * @param error - The confirmation-wait error that triggered this call
+ * @returns The settlement_pending or terminal SettleResponse
+ */
+export async function recordPendingOrTerminal(
+  store: PendingSettlementStore,
+  key: string,
+  signature: string,
+  payer: string,
+  network: Network,
+  pendingReason: string,
+  terminalReason: string,
+  error: unknown,
+): Promise<SettleResponse> {
+  try {
+    await store.set(key, signature);
+  } catch (storeError) {
+    return {
+      success: false,
+      errorReason: terminalReason,
+      errorMessage: `settlement_pending, but failed to persist for retry: ${
+        storeError instanceof Error ? storeError.message : String(storeError)
+      }`,
+      transaction: signature,
+      network,
+      payer,
+    };
+  }
+  return {
+    success: false,
+    errorReason: pendingReason,
+    errorMessage: error instanceof Error ? error.message : String(error),
+    transaction: signature,
+    network,
+    payer,
+  };
 }
 
 // Re-export from core for backward compatibility

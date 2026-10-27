@@ -26,18 +26,25 @@ import type {
 } from "@x402/core/types";
 import type { PaymentPayloadV1, PaymentRequirementsV1 } from "@x402/core/types/v1";
 import {
+  ADVERTISED_TRANSACTION_VERSIONS,
   LIGHTHOUSE_PROGRAM_ADDRESS,
   MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS,
   MEMO_PROGRAM_ADDRESS,
 } from "../../../constants";
+import { ErrUnsupportedTransactionVersion } from "../../facilitator/errors";
 import { SettlementCache } from "../../../settlement-cache";
 import type { FacilitatorSvmSigner } from "../../../signer";
 import type { ExactSvmPayloadV1 } from "../../../types";
 import {
   decodeTransactionFromPayload,
   getTokenPayerFromTransaction,
+  isAcceptedTransactionVersion,
+  peekWireTransactionVersion,
   transactionMessageHash,
 } from "../../../utils";
+import { verifyRequiredSignatures } from "../../facilitator/signatureVerification";
+
+const compiledMessageDecoder = getCompiledTransactionMessageDecoder();
 
 const IX_TOKEN_TRANSFER_CHECKED = 12;
 
@@ -79,6 +86,7 @@ export class ExactSvmSchemeV1 implements SchemeNetworkFacilitator {
 
     return {
       feePayer: addresses[randomIndex],
+      transactionVersions: [...ADVERTISED_TRANSACTION_VERSIONS],
     };
   }
 
@@ -144,6 +152,17 @@ export class ExactSvmSchemeV1 implements SchemeNetworkFacilitator {
     }
 
     // Step 2: Parse and Validate Transaction Structure
+    // Read the version from the raw bytes first so a newer wire format is
+    // reported as unsupported however the installed decoder handles it.
+    const wireVersion = peekWireTransactionVersion(exactSvmPayload.transaction);
+    if (wireVersion !== undefined && !isAcceptedTransactionVersion(wireVersion)) {
+      return {
+        isValid: false,
+        invalidReason: ErrUnsupportedTransactionVersion,
+        payer: "",
+      };
+    }
+
     let transaction;
     try {
       transaction = decodeTransactionFromPayload(exactSvmPayload);
@@ -155,8 +174,53 @@ export class ExactSvmSchemeV1 implements SchemeNetworkFacilitator {
       };
     }
 
-    const compiled = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
-    const decompiled = decompileTransactionMessage(compiled);
+    let compiled;
+    try {
+      compiled = compiledMessageDecoder.decode(transaction.messageBytes);
+    } catch {
+      return {
+        isValid: false,
+        invalidReason: "invalid_exact_svm_payload_transaction_could_not_be_decoded",
+        payer: "",
+      };
+    }
+
+    // Reject any message version this verifier does not model before touching
+    // signatures or instructions (its compute budget checks assume the
+    // ComputeBudget instruction pair of legacy and version 0 messages).
+    if (!isAcceptedTransactionVersion(compiled.version)) {
+      return {
+        isValid: false,
+        invalidReason: ErrUnsupportedTransactionVersion,
+        payer: "",
+      };
+    }
+
+    const signatureCheck = await verifyRequiredSignatures(
+      transaction,
+      compiled,
+      requirementsV1.extra.feePayer,
+    );
+    if (!signatureCheck.ok) {
+      return {
+        isValid: false,
+        invalidReason: signatureCheck.invalidReason,
+        payer: "",
+      };
+    }
+
+    let decompiled;
+    try {
+      decompiled = decompileTransactionMessage(compiled);
+    } catch {
+      // v1 has no ALT resolution; reject lookup-table transactions cleanly
+      // rather than throwing out of verify().
+      return {
+        isValid: false,
+        invalidReason: "invalid_exact_svm_payload_transaction_could_not_be_decoded",
+        payer: "",
+      };
+    }
     const instructions = decompiled.instructions ?? [];
 
     // Allow 3-6 instructions:
@@ -344,20 +408,12 @@ export class ExactSvmSchemeV1 implements SchemeNetworkFacilitator {
       }
     }
 
-    // Step 6: Sign and Simulate Transaction
+    // Step 6: Simulate Transaction
     // CRITICAL: Simulation proves transaction will succeed (catches insufficient balance, invalid accounts, etc)
+    // Signatures are verified locally; the fee-payer slot is unsigned until settle.
     try {
-      const feePayer = requirementsV1.extra.feePayer as Address;
-
-      // Sign transaction with the feePayer's signer
-      const fullySignedTransaction = await this.signer.signTransaction(
-        exactSvmPayload.transaction,
-        feePayer,
-        requirements.network,
-      );
-
       // Simulate to verify transaction would succeed
-      await this.signer.simulateTransaction(fullySignedTransaction, requirements.network);
+      await this.signer.simulateTransaction(exactSvmPayload.transaction, requirements.network);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
@@ -390,33 +446,69 @@ export class ExactSvmSchemeV1 implements SchemeNetworkFacilitator {
     const payloadV1 = payload as unknown as PaymentPayloadV1;
     const exactSvmPayload = payload.payload as ExactSvmPayloadV1;
 
-    const valid = await this.verify(payload, requirements);
-    if (!valid.isValid) {
-      return {
-        success: false,
-        network: payloadV1.network,
-        transaction: "",
-        errorReason: valid.invalidReason ?? "verification_failed",
-        payer: valid.payer || "",
-      };
-    }
-
     // Decode the transaction to compute the message hash used as the cache key.
     // Must remain synchronous (before any await) so concurrent settle calls for
     // the same payment are caught before any async work begins.
-    const decodedTx = decodeTransactionFromPayload(exactSvmPayload);
+    let txKey: string | undefined;
+    let decodedTx: ReturnType<typeof decodeTransactionFromPayload> | undefined;
+    try {
+      decodedTx = decodeTransactionFromPayload(exactSvmPayload);
+      txKey = transactionMessageHash(decodedTx);
+    } catch {
+      txKey = undefined;
+    }
+    if (decodedTx) {
+      try {
+        const compiled = compiledMessageDecoder.decode(decodedTx.messageBytes);
+        if (!isAcceptedTransactionVersion(compiled.version)) {
+          return {
+            success: false,
+            network: payloadV1.network,
+            transaction: "",
+            errorReason: ErrUnsupportedTransactionVersion,
+            payer: "",
+          };
+        }
+      } catch {
+        // Verification below owns the canonical malformed-message error. Keep
+        // the cache key so decode stubs and future decoder failures do not
+        // accidentally disable deduplication.
+      }
+    }
 
     // Duplicate settlement check keyed on message hash (immune to mutable fee-payer sig at slot 0).
-    const txKey = transactionMessageHash(decodedTx);
-    if (this.settlementCache.isDuplicate(txKey)) {
+    if (txKey && this.settlementCache.isDuplicate(txKey)) {
+      let payer = "";
+      try {
+        payer = getTokenPayerFromTransaction(decodedTx!) || "";
+      } catch {
+        payer = "";
+      }
       return {
         success: false,
         network: payloadV1.network,
         transaction: "",
         errorReason: "duplicate_settlement",
+        payer,
+      };
+    }
+
+    const valid = await this.verify(payload, requirements);
+    if (!valid.isValid) {
+      if (txKey) {
+        this.settlementCache.delete(txKey);
+      }
+      return {
+        success: false,
+        network: payloadV1.network,
+        transaction: "",
+        errorReason: valid.invalidReason ?? "verification_failed",
+        errorMessage: valid.invalidMessage,
         payer: valid.payer || "",
       };
     }
+
+    txKey ??= transactionMessageHash(decodeTransactionFromPayload(exactSvmPayload));
 
     try {
       // Extract feePayer from requirements (already validated in verify)

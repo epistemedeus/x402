@@ -10,10 +10,11 @@ import {
 } from "../types/facilitator";
 import { z } from "../schemas";
 import { safeBase64Decode } from "../utils";
+import { MAX_CONTROL_PLANE_RESPONSE_BYTES, readLimitedText } from "./responseBody";
 
 const DEFAULT_FACILITATOR_URL = "https://x402.org/facilitator";
 /** Default per-request timeout for facilitator HTTP calls, in milliseconds */
-const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 90_000;
 /**
  * Upper bound for timeoutMs (2^31 - 1). AbortSignal.timeout() requires an
  * integer, and larger values overflow Node's 32-bit timers, which would
@@ -28,7 +29,7 @@ export interface FacilitatorConfig {
    * `verify()`, `settle()`, and every `getSupported()` attempt — covering both
    * response headers and body consumption. Must be a positive integer no
    * greater than 2_147_483_647 (2^31 - 1, about 24.8 days).
-   * Defaults to 30_000 (30 seconds), matching the Go and Python facilitator clients.
+   * Defaults to 90_000 (90 seconds).
    *
    * On expiry the operation rejects with {@link FacilitatorTimeoutError}. For
    * `settle()` a timeout is an indeterminate outcome: the facilitator may still
@@ -253,22 +254,42 @@ function isAbortOrTimeoutError(error: unknown): boolean {
 const EXTENSION_RESPONSE_LOG_FIELD_ALLOWLIST = ["status", "rejectedReason", "reason", "code"];
 
 /**
+ * Decodes the facilitator `EXTENSION-RESPONSES` header into a plain object.
+ * Returns undefined when the header is missing or malformed.
+ *
+ * @param response - The HTTP response from the facilitator
+ * @returns Decoded extension responses, or undefined if missing/malformed
+ */
+function extractExtensionResponsesHeader(response: Response): Record<string, unknown> | undefined {
+  const header = response.headers.get("EXTENSION-RESPONSES");
+  if (!header) return undefined;
+  try {
+    const decoded = JSON.parse(safeBase64Decode(header));
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      return undefined;
+    }
+    return decoded as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Reads the `EXTENSION-RESPONSES` header from a facilitator HTTP response and logs
  * allowlisted fields. Silently ignores malformed headers.
  *
  * @param response - The HTTP response from the facilitator
+ * @param decoded - Optional pre-decoded header object (avoids double-parse)
  */
-function logExtensionResponsesHeader(response: Response): void {
-  const header = response.headers.get("EXTENSION-RESPONSES");
-  if (!header) return;
+function logExtensionResponsesHeader(response: Response, decoded?: Record<string, unknown>): void {
+  const payload = decoded ?? extractExtensionResponsesHeader(response);
+  if (!payload) return;
   try {
-    const decoded = JSON.parse(safeBase64Decode(header));
-    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) return;
     const sanitized: Record<string, Record<string, unknown>> = {};
-    for (const [extensionKey, payload] of Object.entries(decoded as Record<string, unknown>)) {
+    for (const [extensionKey, value] of Object.entries(payload)) {
       const source =
-        payload && typeof payload === "object" && !Array.isArray(payload)
-          ? (payload as Record<string, unknown>)
+        value && typeof value === "object" && !Array.isArray(value)
+          ? (value as Record<string, unknown>)
           : {};
       const filtered: Record<string, unknown> = {};
       for (const key of EXTENSION_RESPONSE_LOG_FIELD_ALLOWLIST) {
@@ -280,8 +301,28 @@ function logExtensionResponsesHeader(response: Response): void {
     }
     console.log(`[x402] extension responses: ${JSON.stringify(sanitized)}`);
   } catch {
-    // Ignore malformed header
+    // Ignore malformed payload shapes
   }
+}
+
+/**
+ * Attach decoded EXTENSION-RESPONSES onto `extensionResponses` (server-internal
+ * sidechannel). Never merges into `extensions`, which remains body-only and may
+ * be forwarded to buyers via PAYMENT-RESPONSE.
+ *
+ * @param result - Facilitator response object to annotate
+ * @param response - The HTTP response from the facilitator
+ * @returns The same result, possibly with extensionResponses set
+ */
+function attachExtensionResponsesFromHeader<
+  T extends { extensionResponses?: Record<string, unknown> },
+>(result: T, response: Response): T {
+  const headerExtensions = extractExtensionResponsesHeader(response);
+  logExtensionResponsesHeader(response, headerExtensions);
+  if (headerExtensions) {
+    result.extensionResponses = headerExtensions;
+  }
+  return result;
 }
 
 /**
@@ -297,7 +338,7 @@ async function parseSuccessResponse<T>(
   schema: z.ZodType<T, z.ZodTypeDef, unknown>,
   operation: string,
 ): Promise<T> {
-  const text = await response.text();
+  const text = await readLimitedText(response, MAX_CONTROL_PLANE_RESPONSE_BYTES);
 
   let data: unknown;
   try {
@@ -381,7 +422,7 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
       });
 
       if (!response.ok) {
-        const text = await response.text();
+        const text = await readLimitedText(response, MAX_CONTROL_PLANE_RESPONSE_BYTES);
         let data: unknown;
         try {
           data = JSON.parse(text);
@@ -401,8 +442,7 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
       }
 
       const verifyResult = await parseSuccessResponse(response, verifyResponseSchema, "verify");
-      logExtensionResponsesHeader(response);
-      return verifyResult;
+      return attachExtensionResponsesFromHeader(verifyResult, response);
     });
   }
 
@@ -440,7 +480,7 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
       });
 
       if (!response.ok) {
-        const text = await response.text();
+        const text = await readLimitedText(response, MAX_CONTROL_PLANE_RESPONSE_BYTES);
         let data: unknown;
         try {
           data = JSON.parse(text);
@@ -460,8 +500,7 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
       }
 
       const settleResult = await parseSuccessResponse(response, settleResponseSchema, "settle");
-      logExtensionResponsesHeader(response);
-      return settleResult;
+      return attachExtensionResponsesFromHeader(settleResult, response);
     });
   }
 
@@ -498,15 +537,17 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
           };
         }
 
-        const errorText = await response.text().catch((cause: unknown) => {
-          // A deadline abort during the error-body read must surface as a
-          // timeout, not be masked as a generic HTTP failure (which would be
-          // retried for 429). statusText covers other body-read failures.
-          if (isAbortOrTimeoutError(cause)) {
-            throw cause;
-          }
-          return response.statusText;
-        });
+        const errorText = await readLimitedText(response, MAX_CONTROL_PLANE_RESPONSE_BYTES).catch(
+          (cause: unknown) => {
+            // A deadline abort during the error-body read must surface as a
+            // timeout, not be masked as a generic HTTP failure (which would be
+            // retried for 429). statusText covers other body-read failures.
+            if (isAbortOrTimeoutError(cause)) {
+              throw cause;
+            }
+            return response.statusText;
+          },
+        );
         return {
           kind: "http-error" as const,
           status: response.status,

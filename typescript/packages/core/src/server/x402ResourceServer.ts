@@ -4,6 +4,7 @@ import {
   VerifyResponse,
   SupportedResponse,
   SupportedKind,
+  FacilitatorCapabilityError,
 } from "../types/facilitator";
 import {
   PaymentPayload,
@@ -21,6 +22,7 @@ import type { DeepReadonly } from "../types/readonly";
 import {
   ADDITIVE_ARRAY_INFO_FIELDS,
   ADDITIVE_ARRAY_MAX_LENGTHS,
+  SERVER_OWNED_INFO_FIELDS,
   deepEqual,
   convertToTokenAmount,
   findByNetworkAndScheme,
@@ -142,6 +144,19 @@ export interface SettleFailureContext extends SettleContext {
   error: Error;
 }
 
+/**
+ * Generic (scheme/network-agnostic) settle error reason meaning a
+ * transaction broadcast successfully but its receipt/confirmation wait
+ * failed — non-terminal, and always carries the broadcast transaction hash
+ * so a caller can reconcile onchain. Duplicated here (rather than imported
+ * from a mechanism package) so core does not depend on the mechanisms
+ * packages, mirroring Go's `x402.ErrSettlementPending`
+ * (`go/errors.go`) and its mechanism-level counterparts
+ * (`evm.ErrSettlementPending`, `svm.ErrSettlementPending`). Used by
+ * {@link x402ResourceServer.settlePayment}'s single automatic settle retry.
+ */
+const SETTLEMENT_PENDING_REASON = "settlement_pending";
+
 export type VerifiedPaymentCancellationReason =
   | "handler_threw"
   | "handler_failed"
@@ -201,7 +216,62 @@ export type BeforeSettleHook = (
   void | { abort: true; reason: string; message?: string } | { skip: true; result: SettleResponse }
 >;
 
+/**
+ * Runs after a successful settle. Thrown errors are logged and do not affect the
+ * settlement, except {@link AfterSettleAbortError}, which fails the settle closed
+ * (`success: false`) while keeping transaction, amount, payer, and onchain extra.
+ */
 export type AfterSettleHook = (context: SettleResultContext) => Promise<void>;
+
+const AFTER_SETTLE_ABORT_NAME = "AfterSettleAbortError";
+// Registry symbol so separately bundled copies of this module share the marker.
+const AFTER_SETTLE_ABORTED = Symbol.for("x402.afterSettleAborted");
+
+/**
+ * Thrown from an `afterSettle` hook to fail a successful settle closed after funds
+ * moved onchain but the server could not persist the outcome (e.g. a voucher store failure).
+ */
+export class AfterSettleAbortError extends Error {
+  readonly reason: string;
+
+  /**
+   * Creates an AfterSettleAbortError.
+   *
+   * @param reason - Machine-readable failure reason surfaced as `errorReason`
+   * @param message - Optional human-readable detail surfaced as `errorMessage`
+   */
+  constructor(reason: string, message?: string) {
+    super(message || reason);
+    this.name = AFTER_SETTLE_ABORT_NAME;
+    this.reason = reason;
+  }
+}
+
+/**
+ * Reports whether an `afterSettle` hook error is an {@link AfterSettleAbortError}. Matches on
+ * `name` as well as `instanceof` so an abort thrown from another bundled copy of this package
+ * still fails the settle closed.
+ *
+ * @param error - Value thrown by an `afterSettle` hook
+ * @returns True when the error is an AfterSettleAbortError
+ */
+function isAfterSettleAbortError(error: unknown): error is AfterSettleAbortError {
+  return (
+    error instanceof AfterSettleAbortError ||
+    (error instanceof Error && error.name === AFTER_SETTLE_ABORT_NAME)
+  );
+}
+
+/**
+ * Reports whether an `afterSettle` abort failed this onchain-successful settle response closed.
+ * The marker is a non-enumerable symbol property, so it never reaches the wire.
+ *
+ * @param response - Settlement response returned by {@link x402ResourceServer.settlePayment}
+ * @returns True when the response was failed closed by an {@link AfterSettleAbortError}
+ */
+export function isAfterSettleAborted(response: SettleResponse): boolean {
+  return AFTER_SETTLE_ABORTED in response;
+}
 
 export type OnSettleFailureHook = (
   context: SettleFailureContext,
@@ -263,29 +333,42 @@ export function resolveSettlementOverrideAmount(
   requirements: PaymentRequirements,
   decimals?: number,
 ): string {
+  let resolved: string;
+
   // Percent format: "50%" or "33.33%"
   const percentMatch = rawAmount.match(/^(\d+(?:\.\d{0,2})?)%$/);
   if (percentMatch) {
     const [intPart, decPart = ""] = percentMatch[1].split(".");
     const scaledPercent = BigInt(intPart) * 100n + BigInt(decPart.padEnd(2, "0").slice(0, 2));
     const base = BigInt(requirements.amount);
-    return ((base * scaledPercent) / 10000n).toString();
-  }
-
-  // Dollar price format: "$0.05"
-  const dollarMatch = rawAmount.match(/^\$(\d+(?:\.\d+)?)$/);
-  if (dollarMatch) {
-    if (decimals === undefined) {
-      throw new Error(
-        `Cannot convert dollar settlement override "${rawAmount}" to atomic units: ` +
-          `asset decimals are unknown. Pass an atomic amount or register the asset.`,
-      );
+    resolved = ((base * scaledPercent) / 10000n).toString();
+  } else {
+    // Dollar price format: "$0.05"
+    const dollarMatch = rawAmount.match(/^\$(\d+(?:\.\d+)?)$/);
+    if (dollarMatch) {
+      if (decimals === undefined) {
+        throw new Error(
+          `Cannot convert dollar settlement override "${rawAmount}" to atomic units: ` +
+            `asset decimals are unknown. Pass an atomic amount or register the asset.`,
+        );
+      }
+      resolved = convertToTokenAmount(dollarMatch[1], decimals);
+    } else {
+      // Raw atomic units (existing behavior)
+      resolved = rawAmount;
     }
-    return convertToTokenAmount(dollarMatch[1], decimals);
   }
 
-  // Raw atomic units (existing behavior)
-  return rawAmount;
+  // SettlementOverrides.amount's own contract: the resolved amount must be
+  // <= the authorized maximum in PaymentRequirements, for every format above.
+  if (BigInt(resolved) > BigInt(requirements.amount)) {
+    throw new Error(
+      `Settlement override amount "${rawAmount}" resolves to ${resolved} atomic units, ` +
+        `which exceeds the authorized maximum of ${requirements.amount} in PaymentRequirements.`,
+    );
+  }
+
+  return resolved;
 }
 
 type HookAdapterHandles = {
@@ -553,7 +636,8 @@ export class x402ResourceServer {
   }
 
   /**
-   * Register a hook to execute after successful payment verification.
+   * Register a hook to execute after verification returns a result, including
+   * a facilitator response with `isValid: false`.
    *
    * @param hook - The hook function to register
    * @returns The x402ResourceServer instance for chaining
@@ -564,7 +648,8 @@ export class x402ResourceServer {
   }
 
   /**
-   * Register a hook to execute when payment verification fails.
+   * Register a hook to execute when payment verification throws.
+   * It does not run for a facilitator response with `isValid: false`.
    * Can recover from failure by returning { recovered: true, result: VerifyResponse }
    *
    * @param hook - The hook function to register
@@ -755,12 +840,10 @@ export class x402ResourceServer {
     );
 
     if (!SchemeNetworkServer) {
-      // Fallback to placeholder implementation if no server registered
-      // TODO: Remove this fallback once implementations are registered
-      console.warn(
-        `No server implementation registered for scheme: ${scheme}, network: ${resourceConfig.network}`,
+      throw new Error(
+        `No server implementation registered for ${scheme} on ${resourceConfig.network}. ` +
+          `Make sure to call register() with a scheme server for this network.`,
       );
-      return requirements;
     }
 
     // Find the matching supported kind from facilitator
@@ -899,7 +982,13 @@ export class x402ResourceServer {
 
     // Add extensions if provided
     if (extensions && Object.keys(extensions).length > 0) {
-      response.extensions = extensions;
+      // Shallow copy rather than alias: the enrichment below writes into
+      // response.extensions, and sharing the reference would overwrite the
+      // route declaration itself. That declaration is read again later, when
+      // enrichSettlementResponse runs, so mutating it here silently strips the
+      // route config an extension needs at settlement time. accepts is already
+      // cloned a few lines above for the same reason.
+      response.extensions = { ...extensions };
     }
 
     for (let i = 0; i < workingAccepts.length; i++) {
@@ -1139,7 +1228,7 @@ export class x402ResourceServer {
    * @param requirements - Requirements matched to the payload
    * @param declaredExtensions - Optional per-extension declarations for the request
    * @param transportContext - Optional transport-specific context
-   * @param settledPhases - Settle phases already completed before the handler (for settleOnCancel)
+   * @param settledPhases - Settle phases that already completed for this payment
    * @returns Dispatcher with cancel only
    */
   createPaymentCancellationDispatcher(
@@ -1250,16 +1339,15 @@ export class x402ResourceServer {
             result: settleResult,
             transportContext,
           };
-          for (const { label, hook } of this.getLabeledHooks(
-            "afterSettle",
-            extensionKeysInUse,
-            matchedScheme,
-          )) {
-            try {
-              await hook(skipResultContext);
-            } catch (error) {
-              this.warnResourceServerHookFailure("afterSettle", label, error);
-            }
+          if (
+            await this.runAfterSettleHooks(
+              settleResult,
+              skipResultContext,
+              extensionKeysInUse,
+              matchedScheme,
+            )
+          ) {
+            return settleResult;
           }
           await this.enrichSettlementResponse(
             settleResult,
@@ -1315,7 +1403,11 @@ export class x402ResourceServer {
 
         for (const client of this.facilitatorClients) {
           try {
-            settleResult = await client.settle(settlePayload, effectiveRequirements);
+            settleResult = await this.settleWithPendingRetry(
+              client,
+              settlePayload,
+              effectiveRequirements,
+            );
             break;
           } catch (error) {
             lastError = error as Error;
@@ -1332,7 +1424,41 @@ export class x402ResourceServer {
         }
       } else {
         // Use the specific facilitator that supports this payment
-        settleResult = await facilitatorClient.settle(settlePayload, effectiveRequirements);
+        settleResult = await this.settleWithPendingRetry(
+          facilitatorClient,
+          settlePayload,
+          effectiveRequirements,
+        );
+      }
+
+      // A returned (non-thrown) settleResult with success:false — e.g. from a
+      // remote/HTTP facilitator, or a settlement_pending outcome that
+      // survived the single automatic retry above — previously looked like a
+      // success: afterSettle hooks would run and callers would treat the
+      // response as settled. Route it through onSettleFailure like a thrown
+      // error so hooks get a chance to recover.
+      if (!settleResult.success) {
+        const failureContext: SettleFailureContext = {
+          ...context,
+          error: settleResponseToError(settleResult),
+        };
+
+        for (const { label, hook } of this.getLabeledHooks(
+          "onSettleFailure",
+          extensionKeysInUse,
+          matchedScheme,
+        )) {
+          try {
+            const result = await hook(failureContext);
+            if (result && "recovered" in result && result.recovered) {
+              return result.result;
+            }
+          } catch (error) {
+            this.warnResourceServerHookFailure("onSettleFailure", label, error);
+          }
+        }
+
+        return settleResult;
       }
 
       // Execute afterSettle hooks
@@ -1341,16 +1467,16 @@ export class x402ResourceServer {
         result: settleResult,
       };
 
-      for (const { label, hook } of this.getLabeledHooks(
-        "afterSettle",
-        extensionKeysInUse,
-        matchedScheme,
-      )) {
-        try {
-          await hook(resultContext);
-        } catch (error) {
-          this.warnResourceServerHookFailure("afterSettle", label, error);
-        }
+      // Enrichment must not replace an aborted receipt, which carries the onchain transaction.
+      if (
+        await this.runAfterSettleHooks(
+          settleResult,
+          resultContext,
+          extensionKeysInUse,
+          matchedScheme,
+        )
+      ) {
+        return settleResult;
       }
 
       await this.enrichSettlementResponse(
@@ -1410,33 +1536,39 @@ export class x402ResourceServer {
     }
 
     const serverExtensions = paymentRequired.extensions;
-    if (!serverExtensions || Object.keys(serverExtensions).length === 0) {
-      return { valid: true };
-    }
-
     const clientExtensions = paymentPayload.extensions;
     if (!clientExtensions || Object.keys(clientExtensions).length === 0) {
       return { valid: true };
     }
 
     for (const [key, echoedValue] of Object.entries(clientExtensions)) {
-      if (!Object.prototype.hasOwnProperty.call(serverExtensions, key)) {
-        continue;
-      }
-
-      const advertisedInfo = getExtensionInfo(serverExtensions[key]);
+      const advertisedInfo = getExtensionInfo(serverExtensions?.[key]);
       const echoedInfo = getExtensionInfo(echoedValue);
 
-      const dynamicFields = this.registeredExtensions.get(key)?.dynamicInfoFields;
-      const additiveFields = ADDITIVE_ARRAY_INFO_FIELDS[key];
-      const maxLengths = ADDITIVE_ARRAY_MAX_LENGTHS[key];
+      if (serverExtensions && Object.prototype.hasOwnProperty.call(serverExtensions, key)) {
+        const dynamicFields = this.registeredExtensions.get(key)?.dynamicInfoFields;
+        const additiveFields = ADDITIVE_ARRAY_INFO_FIELDS[key];
+        const maxLengths = ADDITIVE_ARRAY_MAX_LENGTHS[key];
+        if (
+          !extensionInfoMatchesAdvertised(
+            omitFields(advertisedInfo, dynamicFields),
+            omitFields(echoedInfo, dynamicFields),
+            additiveFields,
+            maxLengths,
+          )
+        ) {
+          return {
+            valid: false,
+            invalidReason: "extension_echo_mismatch",
+            extensionKey: key,
+          };
+        }
+      }
+
+      const serverOwnedFields = SERVER_OWNED_INFO_FIELDS[key];
       if (
-        !extensionInfoMatchesAdvertised(
-          omitFields(advertisedInfo, dynamicFields),
-          omitFields(echoedInfo, dynamicFields),
-          additiveFields,
-          maxLengths,
-        )
+        serverOwnedFields &&
+        !serverOwnedInfoFieldsMatch(advertisedInfo, echoedInfo, serverOwnedFields)
       ) {
         return {
           valid: false,
@@ -1500,6 +1632,47 @@ export class x402ResourceServer {
   }
 
   /**
+   * Calls `facilitatorClient.settle` once, then retries exactly once with the
+   * identical payload/requirements when the outcome is a non-terminal
+   * `settlement_pending` failure carrying a broadcast transaction hash. Sits
+   * above all scheme/network dispatch — the mechanism that actually handles
+   * the retry (via its own `PendingSettlementStore` check) reconciles against
+   * the already-broadcast transaction instead of verifying and broadcasting
+   * a second one. No mutation, backoff, or sleep: the mechanism layer owns
+   * any bounded waiting. Any other outcome (success, or a different failure
+   * reason) short-circuits after the first call. Capped at exactly one retry
+   * regardless of the second outcome, so this can never loop. Mirrors Go's
+   * `settleWithPendingRetry` (`go/server.go`).
+   *
+   * @param facilitatorClient - The facilitator client to call
+   * @param settlePayload - The (possibly enriched) settle-local payload
+   * @param effectiveRequirements - The effective payment requirements
+   * @returns The settle result, either from the first attempt or the single retry
+   */
+  private async settleWithPendingRetry(
+    facilitatorClient: FacilitatorClient,
+    settlePayload: PaymentPayload,
+    effectiveRequirements: PaymentRequirements,
+  ): Promise<SettleResponse> {
+    let result: SettleResponse | undefined;
+    let retryable: boolean;
+    try {
+      result = await facilitatorClient.settle(settlePayload, effectiveRequirements);
+      retryable = isRetryableSettlementPendingResult(result);
+    } catch (error) {
+      if (!isRetryableSettlementPendingError(error)) {
+        throw error;
+      }
+      retryable = true;
+    }
+
+    if (!retryable) {
+      return result!;
+    }
+    return facilitatorClient.settle(settlePayload, effectiveRequirements);
+  }
+
+  /**
    * Validates that each registered scheme's configuration is compatible with the
    * facilitator capabilities advertised for the scheme/network combinations it
    * supports. Only schemes the facilitator actually supports are validated.
@@ -1529,9 +1702,7 @@ export class x402ResourceServer {
     }
 
     if (configErrors.length > 0) {
-      throw new Error(
-        `x402 facilitator capability errors:\n${configErrors.map(e => `  - ${e}`).join("\n")}`,
-      );
+      throw new FacilitatorCapabilityError(configErrors);
     }
   }
 
@@ -1728,7 +1899,7 @@ export class x402ResourceServer {
       matchedScheme.scheme,
       matchedScheme.network,
     );
-    if (!scheme?.settleOnCancel || !settledPhases.includes("before-handler")) {
+    if (!scheme?.settleOnCancel) {
       return;
     }
 
@@ -1758,6 +1929,47 @@ export class x402ResourceServer {
         network: requirements.network as Network,
       };
     }
+  }
+
+  /**
+   * Runs `afterSettle` hooks. An {@link AfterSettleAbortError} fails the onchain-successful settle
+   * closed in place, keeping transaction, amount, payer, and onchain extra, and stops later hooks.
+   * Other thrown errors are logged and non-fatal.
+   *
+   * @param result - Settle response to fail closed (mutated in place) when a hook aborts
+   * @param context - Settle result context passed to each hook
+   * @param extensionKeysInUse - Declared extension keys for this request
+   * @param matchedScheme - Scheme/network selected for this payment
+   * @param matchedScheme.network - Matched payment network
+   * @param matchedScheme.scheme - Matched payment scheme
+   * @returns True when a hook aborted and the result was failed closed
+   */
+  private async runAfterSettleHooks(
+    result: SettleResponse,
+    context: SettleResultContext,
+    extensionKeysInUse: readonly string[],
+    matchedScheme: { network: Network; scheme: string },
+  ): Promise<boolean> {
+    for (const { label, hook } of this.getLabeledHooks(
+      "afterSettle",
+      extensionKeysInUse,
+      matchedScheme,
+    )) {
+      try {
+        await hook(context);
+      } catch (error) {
+        if (!isAfterSettleAbortError(error)) {
+          this.warnResourceServerHookFailure("afterSettle", label, error);
+          continue;
+        }
+        result.success = false;
+        result.errorReason = error.reason;
+        result.errorMessage = error.message;
+        Object.defineProperty(result, AFTER_SETTLE_ABORTED, { value: true });
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -1855,6 +2067,50 @@ function getExtensionInfo(value: unknown): unknown {
 }
 
 /**
+ * Returns whether client-echoed server-owned fields match the server advertisement.
+ * When the server did not declare the extension, `advertised` is treated as empty
+ * so clients cannot invent fields such as builder-code `a`.
+ *
+ * @param advertised - Extension info advertised by the server, if any.
+ * @param echoed - Extension info echoed back by the client.
+ * @param serverOwnedFields - Field names the client must not invent.
+ * @returns True when every echoed server-owned field matches the advertisement.
+ */
+function serverOwnedInfoFieldsMatch(
+  advertised: unknown,
+  echoed: unknown,
+  serverOwnedFields: ReadonlySet<string>,
+): boolean {
+  if (echoed === null || typeof echoed !== "object" || Array.isArray(echoed)) {
+    return true;
+  }
+
+  const echoedRecord = echoed as Record<string, unknown>;
+  const advertisedRecord =
+    advertised !== null && typeof advertised === "object" && !Array.isArray(advertised)
+      ? (advertised as Record<string, unknown>)
+      : {};
+
+  for (const field of serverOwnedFields) {
+    if (!Object.prototype.hasOwnProperty.call(echoedRecord, field)) {
+      continue;
+    }
+    const echoedValue = echoedRecord[field];
+    if (echoedValue === undefined) {
+      continue;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(advertisedRecord, field) ||
+      !deepEqual(advertisedRecord[field], echoedValue)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * Returns a copy of an object without the named dynamic fields.
  *
  * @param value - Object to filter (extension info or payment-requirements extra).
@@ -1894,6 +2150,55 @@ function extensionInfoMatchesAdvertised(
   maxLengths?: Record<string, number>,
 ): boolean {
   return objectContainsSubset(advertised, echoed, additiveFields, maxLengths);
+}
+
+/**
+ * Reports whether a returned (non-thrown) settle outcome is a retryable
+ * `settlement_pending`: `success: false`, `errorReason === "settlement_pending"`,
+ * and a non-empty `transaction` hash. Mirrors Go's `isRetryableSettlementPending`
+ * (`go/server.go`) for the HTTP/remote `FacilitatorClient` path.
+ *
+ * @param result - The settle response to inspect
+ * @returns Whether the result is a retryable settlement_pending outcome
+ */
+function isRetryableSettlementPendingResult(result: SettleResponse): boolean {
+  return (
+    !result.success && result.errorReason === SETTLEMENT_PENDING_REASON && !!result.transaction
+  );
+}
+
+/**
+ * Reports whether a thrown settle outcome is a retryable `settlement_pending`:
+ * a {@link SettleError} with `errorReason === "settlement_pending"` and a
+ * non-empty `transaction` hash. Mirrors Go's `isRetryableSettlementPending`
+ * (`go/server.go`) for the local/in-process `FacilitatorClient` path, where a
+ * business-logic settlement_pending failure is thrown rather than returned.
+ *
+ * @param error - The thrown value to inspect
+ * @returns Whether the error is a retryable settlement_pending outcome
+ */
+function isRetryableSettlementPendingError(error: unknown): boolean {
+  return (
+    error instanceof SettleError &&
+    error.errorReason === SETTLEMENT_PENDING_REASON &&
+    !!error.transaction
+  );
+}
+
+/**
+ * Synthesizes an {@link Error} from a returned `success: false`
+ * {@link SettleResponse} so it can flow through the same
+ * {@link SettleFailureContext} / {@link OnSettleFailureHook} path as a thrown
+ * error. Mirrors Go's `settleResponseToError` (`go/server.go`) and Python's
+ * `Exception(settle_result.error_reason or "Settlement failed")` fallback
+ * (`python/x402/server_base.py`).
+ *
+ * @param result - The failed settle response
+ * @returns A {@link SettleError} carrying the response's failure details
+ */
+function settleResponseToError(result: SettleResponse): SettleError {
+  const reason = result.errorReason || "Settlement failed";
+  return new SettleError(500, { ...result, errorReason: reason });
 }
 
 /**

@@ -16,43 +16,29 @@ import (
 	"github.com/x402-foundation/x402/go/v2/types"
 )
 
-// Compile-time assertion: BatchSettlementEvmScheme satisfies the optional
-// ExtensionAwareClient interface so x402Client routes payments through the
-// extension-aware path when the server's 402 advertises gas-sponsoring keys.
-var _ x402.ExtensionAwareClient = (*BatchSettlementEvmScheme)(nil)
+var _ x402.SchemeNetworkClient = (*BatchSettlementEvmScheme)(nil)
 
-// CreatePaymentPayloadWithExtensions creates a batched payment payload with
-// extension awareness when `paymentRequired.extensions` advertises EIP-2612 or
-// ERC-20 approval gas sponsoring.
+// enrichDepositWithGasSponsoring attaches EIP-2612 or ERC-20 approval gas
+// sponsoring when `payloadCtx.Extensions` advertises those keys.
 //
 // Behavior matches the exact / upto schemes:
 //
-//  1. Build the base payload (deposit-or-voucher) via the standard
-//     CreatePaymentPayload flow.
-//  2. Skip extension enrichment for non-deposit payloads (vouchers don't
+//  1. Skip extension enrichment for non-deposit payloads (vouchers don't
 //     need a token approve).
-//  3. Skip extension enrichment for non-Permit2 deposits (ERC-3009 carries
+//  2. Skip extension enrichment for non-Permit2 deposits (ERC-3009 carries
 //     its own gas-funded transfer authorization).
-//  4. Try EIP-2612 first; on a successful permit signature, attach
+//  3. Try EIP-2612 first; on a successful permit signature, attach
 //     `extensions.eip2612GasSponsoring.info` and return.
-//  5. Fall back to ERC-20 approval; on success, attach
+//  4. Fall back to ERC-20 approval; on success, attach
 //     `extensions.erc20ApprovalGasSponsoring.info`.
-//  6. If neither extension applies (allowance already sufficient, or token
+//  5. If neither extension applies (allowance already sufficient, or token
 //     does not advertise EIP-712 domain fields), return the base payload.
-//
-// Implements the optional `x402.ExtensionAwareClient` interface so
-// `x402Client.CreatePaymentPayload` calls this path automatically when the
-// server's 402 contains extension declarations.
-func (c *BatchSettlementEvmScheme) CreatePaymentPayloadWithExtensions(
+func (c *BatchSettlementEvmScheme) enrichDepositWithGasSponsoring(
 	ctx context.Context,
 	requirements types.PaymentRequirements,
-	extensions map[string]interface{},
+	result types.PaymentPayload,
+	payloadCtx x402.PaymentPayloadContext,
 ) (types.PaymentPayload, error) {
-	result, err := c.CreatePaymentPayload(ctx, requirements)
-	if err != nil {
-		return types.PaymentPayload{}, err
-	}
-
 	// Vouchers never need a Permit2 approval — the deposit already established
 	// the channel balance. Voucher payloads have type="voucher" without a
 	// `deposit` field; bail before attempting extension signing.
@@ -85,6 +71,8 @@ func (c *BatchSettlementEvmScheme) CreatePaymentPayloadWithExtensions(
 	if !isPermit2 {
 		return result, nil
 	}
+
+	extensions := payloadCtx.Extensions
 
 	if extData, eipErr := c.trySignEip2612Permit(ctx, requirements, result, extensions); eipErr == nil && extData != nil {
 		result.Extensions = extData
@@ -130,18 +118,6 @@ func (c *BatchSettlementEvmScheme) trySignEip2612Permit(
 		return nil, nil
 	}
 
-	readSigner, ok := c.signer.(evm.ClientEvmSignerWithReadContract)
-	if !ok {
-		return nil, nil
-	}
-
-	chainID, err := evm.GetEvmChainId(string(requirements.Network))
-	if err != nil {
-		return nil, err
-	}
-
-	tokenAddress := evm.NormalizeAddress(requirements.Asset)
-
 	// Pull `payload.deposit.amount` from the freshly-built batched deposit
 	// payload. The signed EIP-2612 `info.amount` must equal the BATCH
 	// deposit (what the facilitator's `validateBatchEip2612Permit` checks),
@@ -157,6 +133,27 @@ func (c *BatchSettlementEvmScheme) trySignEip2612Permit(
 	if depositAmount == "" {
 		return nil, nil
 	}
+
+	readSigner, err := evm.ResolveReadSigner(ctx, c.signer, "")
+	if err != nil {
+		return nil, err
+	}
+	if readSigner == nil {
+		c.warnings.WarnMissingCapability(
+			"batch-settlement",
+			string(requirements.Network),
+			eip2612gassponsor.EIP2612GasSponsoring.Key(),
+			"the signer cannot read contracts; provide an RPC-backed signer implementing evm.ClientEvmSignerWithReadContract, such as one created with signers/evm.NewClientSignerFromPrivateKeyWithClient",
+		)
+		return nil, nil
+	}
+
+	chainID, err := evm.GetEvmChainId(string(requirements.Network))
+	if err != nil {
+		return nil, err
+	}
+
+	tokenAddress := evm.NormalizeAddress(requirements.Asset)
 
 	// Allowance short-circuit: if the user has already approved Permit2 for
 	// at least the deposit amount, no permit is needed. The downstream
@@ -222,19 +219,9 @@ func (c *BatchSettlementEvmScheme) trySignErc20Approval(
 		return nil, nil
 	}
 
-	txSigner, ok := c.signer.(evm.ClientEvmSignerWithTxSigning)
-	if !ok {
-		return nil, nil
-	}
-
-	chainID, err := evm.GetEvmChainId(string(requirements.Network))
-	if err != nil {
-		return nil, err
-	}
-
 	tokenAddress := evm.NormalizeAddress(requirements.Asset)
 
-	if readSigner, hasRead := c.signer.(evm.ClientEvmSignerWithReadContract); hasRead {
+	if readSigner, _ := evm.ResolveReadSigner(ctx, c.signer, ""); readSigner != nil {
 		// Approximate the deposit amount with the per-request amount —
 		// sufficient for the allowance short-circuit since `deposit ≥
 		// requirements.Amount` always holds for batched flows. Skip the
@@ -243,6 +230,25 @@ func (c *BatchSettlementEvmScheme) trySignErc20Approval(
 			hasSufficientPermit2Allowance(ctx, readSigner, tokenAddress, c.signer.Address(), requirements.Amount) {
 			return nil, nil
 		}
+	}
+
+	txSigner, err := evm.ResolveTxSigner(ctx, c.signer, "")
+	if err != nil {
+		return nil, err
+	}
+	if txSigner == nil {
+		c.warnings.WarnMissingCapability(
+			"batch-settlement",
+			string(requirements.Network),
+			erc20approvalgassponsor.ERC20ApprovalGasSponsoring.Key(),
+			"the signer cannot sign an ERC-20 approval transaction; provide an RPC-backed signer implementing evm.ClientEvmSignerWithTxSigning, such as one created with signers/evm.NewClientSignerFromPrivateKeyWithClient",
+		)
+		return nil, nil
+	}
+
+	chainID, err := evm.GetEvmChainId(string(requirements.Network))
+	if err != nil {
+		return nil, err
 	}
 
 	info, err := exactclient.SignErc20ApprovalTransaction(ctx, txSigner, tokenAddress, chainID)

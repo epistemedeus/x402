@@ -90,13 +90,19 @@ func flattenEnvMap(env map[string]catalogEnvDecl) catalogEnvList {
 }
 
 type catalogRouteDefinition struct {
-	Scheme              string            `json:"scheme"`
-	Network             string            `json:"network"`
-	AssetTransferMethod string            `json:"assetTransferMethod"`
-	Sdks                []string          `json:"sdks"`
-	Price               catalogPrice      `json:"price"`
-	Extensions          []string          `json:"extensions"`
-	SettlementOverride  *SettlementAmount `json:"settlementOverride"`
+	Scheme              string                 `json:"scheme"`
+	Network             string                 `json:"network"`
+	AssetTransferMethod string                 `json:"assetTransferMethod"`
+	Sdks                []string               `json:"sdks"`
+	SchemeOptions       map[string]bool        `json:"schemeOptions"`
+	RequiresEnv         string                 `json:"requiresEnv"`
+	RequiresEnvAbsent   string                 `json:"requiresEnvAbsent"`
+	SchemeExtra         map[string]interface{} `json:"schemeExtra"`
+	Price               catalogPrice           `json:"price"`
+	Extensions          []string               `json:"extensions"`
+	SettlementOverride  *SettlementAmount      `json:"settlementOverride"`
+	PaymentFlow         string                 `json:"paymentFlow"`
+	RequirementsExtra   map[string]interface{} `json:"requirementsExtra"`
 }
 
 // SettlementAmount is the partial amount an upto route settles.
@@ -119,9 +125,15 @@ type CatalogRoute struct {
 	Scheme              string
 	Network             string
 	AssetTransferMethod string
+	SchemeOptions       map[string]bool
+	RequiresEnv         string
+	RequiresEnvAbsent   string
+	SchemeExtra         map[string]interface{}
 	Price               catalogPrice
 	Extensions          []string
 	SettlementOverride  *SettlementAmount
+	PaymentFlow         string
+	RequirementsExtra   map[string]interface{}
 }
 
 // ResolvedRoute is a catalog route with env-dependent requirements resolved.
@@ -337,12 +349,28 @@ func routeImplementsSDK(definition catalogRouteDefinition, sdk string) bool {
 	return false
 }
 
+// batchServerRole returns the harness-assigned custody role for this server process.
+// Empty (unset) means "standard": mount everything except facilitator-managed batch routes.
+func batchServerRole() string {
+	role := strings.TrimSpace(strings.ToLower(os.Getenv("E2E_BATCH_SERVER_ROLE")))
+	if role == "" {
+		return "standard"
+	}
+	return role
+}
+
+// isFacilitatorManagedBatch reports whether a catalog route uses facilitator-managed custody.
+func isFacilitatorManagedBatch(definition catalogRouteDefinition) bool {
+	return definition.Scheme == "batch-settlement" && definition.SchemeOptions["facilitatorManaged"]
+}
+
 // CatalogRoutes returns the routes this SDK implements, minus the exclusions the
 // harness injects for surfaces that expose less than the full catalog.
 func CatalogRoutes() []CatalogRoute {
 	catalog := mustLoadCatalog()
 	excludedSchemes := excludedFromEnv("E2E_EXCLUDE_SCHEMES")
 	excludedNetworks := excludedFromEnv("E2E_EXCLUDE_NETWORKS")
+	role := batchServerRole()
 
 	routes := make([]CatalogRoute, 0, len(catalog.RouteOrder))
 	for _, path := range catalog.RouteOrder {
@@ -353,15 +381,34 @@ func CatalogRoutes() []CatalogRoute {
 		if excludedSchemes[definition.Scheme] || excludedNetworks[definition.Network] {
 			continue
 		}
+		if role == "managed-batch" {
+			if !isFacilitatorManagedBatch(definition) {
+				continue
+			}
+		} else if isFacilitatorManagedBatch(definition) {
+			continue
+		}
+		if definition.RequiresEnv != "" && os.Getenv(definition.RequiresEnv) == "" {
+			continue
+		}
+		if definition.RequiresEnvAbsent != "" && os.Getenv(definition.RequiresEnvAbsent) != "" {
+			continue
+		}
 
 		routes = append(routes, CatalogRoute{
 			Path:                path,
 			Scheme:              definition.Scheme,
 			Network:             definition.Network,
 			AssetTransferMethod: definition.AssetTransferMethod,
+			SchemeOptions:       definition.SchemeOptions,
+			RequiresEnv:         definition.RequiresEnv,
+			RequiresEnvAbsent:   definition.RequiresEnvAbsent,
+			SchemeExtra:         definition.SchemeExtra,
 			Price:               definition.Price,
 			Extensions:          definition.Extensions,
 			SettlementOverride:  definition.SettlementOverride,
+			PaymentFlow:         definition.PaymentFlow,
+			RequirementsExtra:   definition.RequirementsExtra,
 		})
 	}
 	return routes
@@ -493,6 +540,30 @@ func resolvePrice(route CatalogRoute, network catalogNetwork, caip2 string) (int
 	return price, nil, nil
 }
 
+// mergeRouteExtra merges catalog requirementsExtra, price-derived extra, and
+// paymentFlow. Authorization is omitted on the wire, matching core
+// applyPaymentFlowWireExtra. Price extra wins over requirementsExtra.
+func mergeRouteExtra(priceExtra map[string]interface{}, routeExtra map[string]interface{}, paymentFlow string) map[string]interface{} {
+	var wireFlow string
+	if paymentFlow != "" && paymentFlow != "authorization" {
+		wireFlow = paymentFlow
+	}
+	if wireFlow == "" && len(priceExtra) == 0 && len(routeExtra) == 0 {
+		return nil
+	}
+	extra := map[string]interface{}{}
+	for key, value := range routeExtra {
+		extra[key] = value
+	}
+	for key, value := range priceExtra {
+		extra[key] = value
+	}
+	if wireFlow != "" {
+		extra["paymentFlow"] = wireFlow
+	}
+	return extra
+}
+
 // ResolvedRoutes resolves every catalog route against this process's env.
 // Routes whose network has no configured payee address are dropped, so the
 // server only advertises what it can settle.
@@ -509,10 +580,19 @@ func ResolvedRoutes() []ResolvedRoute {
 
 		caip2 := NetworkCaip2(route.Network)
 
-		price, extra, err := resolvePrice(route, network, caip2)
+		price, priceExtra, err := resolvePrice(route, network, caip2)
 		if err != nil {
 			fmt.Printf("❌ %v\n", err)
 			os.Exit(1)
+		}
+		extra := mergeRouteExtra(priceExtra, route.RequirementsExtra, route.PaymentFlow)
+		if len(route.SchemeExtra) > 0 {
+			if extra == nil {
+				extra = map[string]interface{}{}
+			}
+			for key, value := range route.SchemeExtra {
+				extra[key] = value
+			}
 		}
 
 		resolved = append(resolved, ResolvedRoute{
@@ -561,7 +641,13 @@ func RouteDescription(route ResolvedRoute) string {
 	if len(sponsoring) > 0 {
 		suffix = " with " + strings.Join(sponsoring, " and ")
 	}
-	return fmt.Sprintf("Protected %s%sendpoint on %s%s", scheme, transfer, label, suffix)
+	flow := ""
+	if route.Extra != nil {
+		if paymentFlow, ok := route.Extra["paymentFlow"].(string); ok && paymentFlow != "" && paymentFlow != "authorization" {
+			flow = " " + paymentFlow
+		}
+	}
+	return fmt.Sprintf("Protected %s%sendpoint on %s%s%s", scheme, transfer, label, flow, suffix)
 }
 
 // McpToolName converts a catalog path to an MCP tool name: "/exact/evm/eip3009" → "exact_evm_eip3009".

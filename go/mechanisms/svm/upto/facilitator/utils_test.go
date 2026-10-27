@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/x402-foundation/x402/go/v2/mechanisms/svm"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/svm/paymentchannels"
+	"github.com/x402-foundation/x402/go/v2/mechanisms/svm/paymentchannels/generated"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/svm/upto"
 	"github.com/x402-foundation/x402/go/v2/types"
 )
@@ -36,6 +38,7 @@ type mockSigner struct {
 
 	keys []solana.PrivateKey
 	sent []*solana.Transaction
+	rpc  *rpc.Client
 
 	// sendErr, when set, fails every broadcast.
 	sendErr error
@@ -97,7 +100,25 @@ func (s *mockSigner) SignTransaction(
 	return errors.New("no signer for fee payer " + feePayer.String())
 }
 
-func (s *mockSigner) SimulateTransaction(_ context.Context, _ *solana.Transaction, _ string) error {
+func (s *mockSigner) SimulateTransaction(
+	ctx context.Context,
+	tx *solana.Transaction,
+	_ string,
+	opts *svm.FacilitatorSimulateTransactionOptions,
+) error {
+	if opts == nil || opts.ReplaceRecentBlockhash == nil || !*opts.ReplaceRecentBlockhash {
+		return nil
+	}
+	if s.rpc == nil {
+		return errors.New("mock signer has no RPC client")
+	}
+	result, err := s.rpc.SimulateTransactionWithOpts(ctx, tx, svm.SimulationRPCOpts(opts))
+	if err != nil {
+		return fmt.Errorf("settlement simulation failed: %w", err)
+	}
+	if result != nil && result.Value != nil && result.Value.Err != nil {
+		return fmt.Errorf("settlement simulation failed: %v", result.Value.Err)
+	}
 	return nil
 }
 
@@ -125,6 +146,52 @@ func (s *mockSigner) SendTransaction(
 
 func (s *mockSigner) ConfirmTransaction(_ context.Context, _ solana.Signature, _ string) error {
 	return s.confirmErr
+}
+
+func (s *mockSigner) attachRPC(client *rpc.Client) {
+	s.rpc = client
+}
+
+func (s *mockSigner) GetAccountInfo(
+	ctx context.Context,
+	account solana.PublicKey,
+	_ string,
+	opts *rpc.GetAccountInfoOpts,
+) (*rpc.GetAccountInfoResult, error) {
+	if s.rpc == nil {
+		return nil, errors.New("mock signer has no RPC client")
+	}
+	return s.rpc.GetAccountInfoWithOpts(ctx, account, opts)
+}
+
+func (s *mockSigner) GetLatestBlockhash(ctx context.Context, _ string) (solana.Hash, uint64, error) {
+	if s.rpc == nil {
+		return solana.Hash{}, 0, errors.New("mock signer has no RPC client")
+	}
+	latest, err := s.rpc.GetLatestBlockhash(ctx, upto.BlockhashCommitment)
+	if err != nil {
+		return solana.Hash{}, 0, err
+	}
+	return latest.Value.Blockhash, latest.Value.LastValidBlockHeight, nil
+}
+
+func (s *mockSigner) GetSlot(ctx context.Context, _ string, commitment rpc.CommitmentType) (uint64, error) {
+	if s.rpc == nil {
+		return 0, errors.New("mock signer has no RPC client")
+	}
+	return s.rpc.GetSlot(ctx, commitment)
+}
+
+func (s *mockSigner) GetProgramAccounts(
+	ctx context.Context,
+	_ string,
+	programID solana.PublicKey,
+	opts *rpc.GetProgramAccountsOpts,
+) (rpc.GetProgramAccountsResult, error) {
+	if s.rpc == nil {
+		return nil, errors.New("mock signer has no RPC client")
+	}
+	return s.rpc.GetProgramAccountsWithOpts(ctx, programID, opts)
 }
 
 func (s *mockSigner) sentTransactions() []*solana.Transaction {
@@ -419,7 +486,7 @@ func (s *stubRPC) commitmentsFor(method string) []string {
 
 // channelAccount is the shape of an onchain channel used to build test accounts.
 type channelAccount struct {
-	Status           paymentchannels.ChannelStatus
+	Status           generated.ChannelStatus
 	Salt             uint64
 	Deposit          uint64
 	Settled          uint64
@@ -438,14 +505,14 @@ func (c channelAccount) encode(t *testing.T) []byte {
 	t.Helper()
 
 	data := make([]byte, paymentchannels.ChannelAccountSize)
-	data[0] = paymentchannels.ChannelAccountDiscriminator
+	data[0] = uint8(generated.AccountDiscriminator_Channel)
 	data[3] = byte(c.Status)
 	binary.LittleEndian.PutUint64(data[4:12], c.Salt)
 	binary.LittleEndian.PutUint64(data[12:20], c.Deposit)
 	binary.LittleEndian.PutUint64(data[20:28], c.Settled)
 	binary.LittleEndian.PutUint32(data[52:56], c.GracePeriod)
 
-	hash, err := paymentchannels.DistributionHash(c.Splits)
+	hash, err := paymentchannels.GetChannelDistributionHash(c.Splits)
 	require.NoError(t, err)
 	copy(data[56:88], hash[:])
 
@@ -478,10 +545,15 @@ type paymentFixture struct {
 
 func newPaymentFixture(t *testing.T, signer *mockSigner) *paymentFixture {
 	t.Helper()
+	authorizer, err := solana.NewRandomPrivateKey()
+	require.NoError(t, err)
+	return newPaymentFixtureWithAuthorizer(t, signer, authorizer)
+}
+
+func newPaymentFixtureWithAuthorizer(t *testing.T, signer *mockSigner, authorizer solana.PrivateKey) *paymentFixture {
+	t.Helper()
 
 	payerKey, err := solana.NewRandomPrivateKey()
-	require.NoError(t, err)
-	authorizer, err := solana.NewRandomPrivateKey()
 	require.NoError(t, err)
 	payTo, err := solana.NewRandomPrivateKey()
 	require.NoError(t, err)
@@ -594,7 +666,7 @@ func (f *paymentFixture) withRequirements(mutate func(requirements *types.Paymen
 // openChannel is the confirmed channel account matching the fixture's open.
 func (f *paymentFixture) openChannel() channelAccount {
 	return channelAccount{
-		Status:           paymentchannels.StatusOpen,
+		Status:           generated.ChannelStatus_Open,
 		Salt:             f.salt,
 		Deposit:          f.deposit,
 		GracePeriod:      f.graceSeconds,

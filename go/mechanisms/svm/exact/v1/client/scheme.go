@@ -57,6 +57,7 @@ func (c *ExactSvmSchemeV1) FindDefaultAsset(asset string, network x402.Network) 
 func (c *ExactSvmSchemeV1) CreatePaymentPayload(
 	ctx context.Context,
 	requirements types.PaymentRequirementsV1,
+	_ x402.PaymentPayloadContext,
 ) (types.PaymentPayloadV1, error) {
 
 	// Validate network (V1 uses simple names, normalize to CAIP-2 internally)
@@ -64,14 +65,22 @@ func (c *ExactSvmSchemeV1) CreatePaymentPayload(
 	if !svm.IsValidNetwork(networkStr) {
 		return types.PaymentPayloadV1{}, fmt.Errorf(ErrUnsupportedNetwork+": %s", requirements.Network)
 	}
+	var extraMap map[string]interface{}
+	if requirements.Extra != nil {
+		if err := json.Unmarshal(*requirements.Extra, &extraMap); err != nil {
+			return types.PaymentPayloadV1{}, fmt.Errorf(ErrInvalidExtraField+": %w", err)
+		}
+	}
+	version, err := svm.ResolveTransactionVersion(extraMap)
+	if err != nil {
+		return types.PaymentPayloadV1{}, err
+	}
 
 	// Get network configuration
 	config, err := svm.GetNetworkConfig(networkStr)
 	if err != nil {
 		return types.PaymentPayloadV1{}, err
 	}
-
-	// Get RPC URL (custom or default)
 	rpcURL := config.RPCURL
 	if c.config != nil && c.config.RPCURL != "" {
 		rpcURL = c.config.RPCURL
@@ -130,13 +139,6 @@ func (c *ExactSvmSchemeV1) CreatePaymentPayload(
 	}
 
 	// Get fee payer from requirements.extra (unmarshal Extra from json.RawMessage)
-	var extraMap map[string]interface{}
-	if requirements.Extra != nil {
-		if err := json.Unmarshal(*requirements.Extra, &extraMap); err != nil {
-			return types.PaymentPayloadV1{}, fmt.Errorf(ErrInvalidExtraField+": %w", err)
-		}
-	}
-
 	feePayerAddr, ok := extraMap["feePayer"].(string)
 	if !ok {
 		return types.PaymentPayloadV1{}, errors.New(ErrFeePayerRequired)
@@ -215,10 +217,13 @@ func (c *ExactSvmSchemeV1) CreatePaymentPayload(
 		return types.PaymentPayloadV1{}, fmt.Errorf(ErrFailedToCreateTransaction+": %w", err)
 	}
 
-	// Set message version to V0 (versioned transaction) for cross-platform compatibility
-	// This ensures the transaction can be correctly signed by facilitators in all languages
-	// (TypeScript, Python, Go) as they all expect versioned transactions
-	tx.Message.SetVersion(solana.MessageVersionV0)
+	// Build the message version the facilitator advertised in
+	// extra.transactionVersions (version 0 when absent). This client only
+	// produces version 0; a facilitator that accepts no version it can build
+	// is reported before signing.
+	if _, err := tx.Message.SetVersion(version); err != nil {
+		return types.PaymentPayloadV1{}, fmt.Errorf("failed to set transaction version: %w", err)
+	}
 
 	// Partially sign with client's key
 	if err := c.signer.SignTransaction(ctx, tx); err != nil {

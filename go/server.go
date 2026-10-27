@@ -8,7 +8,6 @@ import (
 	"log"
 	"math/big"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,29 +26,57 @@ var (
 //   - Percent of requirements.Amount: "50%"  (up to 2 decimal places, floored)
 //   - Dollar price: "$0.05" (converted using the provided decimals)
 func ResolveSettlementOverrideAmount(rawAmount string, requirements types.PaymentRequirements, decimals int) (string, error) {
+	var resolved string
 	if m := percentRegex.FindStringSubmatch(rawAmount); m != nil {
 		parts := strings.SplitN(m[1], ".", 2)
-		intPart, _ := strconv.ParseInt(parts[0], 10, 64)
-		decPart := int64(0)
+		integerPart, ok := new(big.Int).SetString(parts[0], 10)
+		if !ok {
+			return "", fmt.Errorf("invalid percent amount: %s", rawAmount)
+		}
+		fractionalPart := new(big.Int)
 		if len(parts) == 2 {
 			padded := (parts[1] + "00")[:2]
-			decPart, _ = strconv.ParseInt(padded, 10, 64)
+			if _, ok := fractionalPart.SetString(padded, 10); !ok {
+				return "", fmt.Errorf("invalid percent amount: %s", rawAmount)
+			}
 		}
-		scaledPercent := big.NewInt(intPart*100 + decPart)
+		scaledPercent := new(big.Int).Mul(integerPart, big.NewInt(100))
+		scaledPercent.Add(scaledPercent, fractionalPart)
 		base, ok := new(big.Int).SetString(requirements.Amount, 10)
 		if !ok {
 			return "", fmt.Errorf("invalid requirements amount: %s", requirements.Amount)
 		}
 		result := new(big.Int).Mul(base, scaledPercent)
 		result.Div(result, big.NewInt(10000))
-		return result.String(), nil
+		resolved = result.String()
+	} else if m := dollarRegex.FindStringSubmatch(rawAmount); m != nil {
+		converted, err := ConvertToTokenAmount(m[1], decimals)
+		if err != nil {
+			return "", err
+		}
+		resolved = converted
+	} else {
+		resolved = rawAmount
 	}
 
-	if m := dollarRegex.FindStringSubmatch(rawAmount); m != nil {
-		return ConvertToTokenAmount(m[1], decimals)
+	resolvedAmount, ok := new(big.Int).SetString(resolved, 10)
+	if !ok {
+		return "", fmt.Errorf("invalid settlement override amount: %s", rawAmount)
+	}
+	authorized, ok := new(big.Int).SetString(requirements.Amount, 10)
+	if !ok {
+		return "", fmt.Errorf("invalid requirements amount: %s", requirements.Amount)
+	}
+	if resolvedAmount.Cmp(authorized) > 0 {
+		return "", fmt.Errorf(
+			"settlement override amount %q resolves to %s atomic units, which exceeds the authorized maximum of %s in PaymentRequirements",
+			rawAmount,
+			resolved,
+			requirements.Amount,
+		)
 	}
 
-	return rawAmount, nil
+	return resolved, nil
 }
 
 // x402ResourceServer manages payment requirements and verification for protected resources
@@ -115,16 +142,32 @@ type labeledHook[F any] struct {
 type SupportedCache struct {
 	mu     sync.RWMutex
 	data   map[string]SupportedResponse // key is facilitator identifier
+	order  []string                     // registration order; earlier facilitators win
 	expiry map[string]time.Time
 	ttl    time.Duration
 }
 
-// Set stores a supported response in the cache
+// Set stores a supported response in the cache.
+// The first Set for a key records registration order. Later facilitators that
+// advertise the same scheme are fallbacks, not replacements.
 func (c *SupportedCache) Set(key string, response SupportedResponse) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, exists := c.data[key]; !exists {
+		c.order = append(c.order, key)
+	}
 	c.data[key] = response
 	c.expiry[key] = time.Now().Add(c.ttl)
+}
+
+// snapshotLocked returns cached responses in registration order.
+// The caller must hold c.mu.
+func (c *SupportedCache) snapshotLocked() []SupportedResponse {
+	out := make([]SupportedResponse, 0, len(c.order))
+	for _, key := range c.order {
+		out = append(out, c.data[key])
+	}
+	return out
 }
 
 // Get retrieves a supported response from the cache
@@ -152,6 +195,7 @@ func (c *SupportedCache) Clear() {
 
 	clear(c.data)
 	clear(c.expiry)
+	c.order = nil
 }
 
 // ResourceServerOption configures the server
@@ -242,7 +286,7 @@ func (s *x402ResourceServer) Initialize(ctx context.Context) error {
 // it supports. Only schemes the facilitator actually supports are validated, and
 // only schemes implementing FacilitatorSupportValidator participate.
 func (s *x402ResourceServer) validateFacilitatorCapabilities(_ context.Context) error {
-	var problems []error
+	var problems []string
 
 	for network, schemeMap := range s.schemes {
 		for scheme, server := range schemeMap {
@@ -257,7 +301,7 @@ func (s *x402ResourceServer) validateFacilitatorCapabilities(_ context.Context) 
 			}
 
 			if err := validator.ValidateFacilitatorSupport(network, supportedKind, extensions); err != nil {
-				problems = append(problems, fmt.Errorf("%s on %s: %w", scheme, network, err))
+				problems = append(problems, fmt.Sprintf("%s on %s: %s", scheme, network, err.Error()))
 			}
 		}
 	}
@@ -265,7 +309,7 @@ func (s *x402ResourceServer) validateFacilitatorCapabilities(_ context.Context) 
 	if len(problems) == 0 {
 		return nil
 	}
-	return fmt.Errorf("x402 facilitator capability errors: %w", errors.Join(problems...))
+	return NewFacilitatorCapabilityError(problems)
 }
 
 // findSupportedKind scans the cached facilitator responses for the V2 kind matching
@@ -275,7 +319,7 @@ func (s *x402ResourceServer) findSupportedKind(network Network, scheme string) (
 	s.supportedCache.mu.RLock()
 	defer s.supportedCache.mu.RUnlock()
 
-	for _, cachedResponse := range s.supportedCache.data {
+	for _, cachedResponse := range s.supportedCache.snapshotLocked() {
 		for _, kind := range cachedResponse.Kinds {
 			if kind.X402Version != 2 || kind.Scheme != scheme || string(kind.Network) != string(network) {
 				continue
@@ -622,8 +666,8 @@ func (s *x402ResourceServer) CreatePaymentCancellationDispatcher(
 // The HTTP transport calls this after a successful Verify but before/instead
 // of Settle when the resource handler errors or returns a non-2xx response.
 //
-// settledPhases lists settle phases already completed before the handler (for
-// settleOnCancel). Pass nil when none have completed.
+// settledPhases lists settle phases that already completed for this payment.
+// Pass nil when none have completed.
 //
 // Hook execution order (mirrors verify/settle): manual → matched scheme →
 // declared extensions. Extension hooks gate on `declaredExtensions[key]`
@@ -667,24 +711,25 @@ func (s *x402ResourceServer) CreatePaymentCancellationDispatcherWithExtensions(
 				_ = lh.Hook(cancelCtx)
 			}
 
-			return s.settleOnCancelAfterHooks(ctx, payload, requirements, declaredExtensions, resolvedSettledPhases, cancelCtx, scheme)
+			return s.settleOnCancelAfterHooks(ctx, payload, requirements, declaredExtensions, cancelCtx, scheme)
 		},
 	}
 }
 
 // settleOnCancelAfterHooks asks the matched scheme for cancel settle requirements
-// when before-handler settle completed. Settlement errors become a failed receipt.
+// and settles once when provided, including when no before-handler settle has
+// completed. The scheme decides whether cancel settle applies. Settlement
+// errors become a failed receipt.
 func (s *x402ResourceServer) settleOnCancelAfterHooks(
 	ctx context.Context,
 	payload types.PaymentPayload,
 	requirements types.PaymentRequirements,
 	declaredExtensions map[string]interface{},
-	settledPhases []SettlePhase,
 	cancelCtx VerifiedPaymentCanceledContext,
 	scheme SchemeNetworkServer,
 ) *SettleResponse {
 	provider, ok := scheme.(SettleOnCancelProvider)
-	if !ok || !settledPhasesContain(settledPhases, SettlePhaseBeforeHandler) {
+	if !ok {
 		return nil
 	}
 
@@ -706,15 +751,6 @@ func (s *x402ResourceServer) settleOnCancelAfterHooks(
 		return failedCancelSettleResponse(requirements, settleErr)
 	}
 	return settleResp
-}
-
-func settledPhasesContain(phases []SettlePhase, want SettlePhase) bool {
-	for _, p := range phases {
-		if p == want {
-			return true
-		}
-	}
-	return false
 }
 
 func failedCancelSettleResponse(requirements types.PaymentRequirements, err error) *SettleResponse {
@@ -903,6 +939,53 @@ func asStringAnyMap(v interface{}) (map[string]interface{}, bool) {
 	return nil, false
 }
 
+// normalizeJSONValue converts typed Go values to their generic wire shape.
+func normalizeJSONValue(v interface{}) interface{} {
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	var decoded interface{}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return v
+	}
+	return decoded
+}
+
+// extensionInfo returns the normalized info envelope when present, otherwise
+// the normalized extension value itself.
+func extensionInfo(v interface{}) interface{} {
+	normalized := normalizeJSONValue(v)
+	if extension, ok := asStringAnyMap(normalized); ok {
+		if info, has := extension["info"]; has {
+			return info
+		}
+	}
+	return normalized
+}
+
+// serverOwnedInfoFieldsMatch reports whether every server-owned field supplied
+// by the client was independently declared by the resource server with the same
+// value. Undeclared extensions are treated as having no server-owned fields.
+func serverOwnedInfoFieldsMatch(advertised, echoed interface{}, fields map[string]struct{}) bool {
+	echoedMap, ok := asStringAnyMap(echoed)
+	if !ok {
+		return true
+	}
+	advertisedMap, _ := asStringAnyMap(advertised)
+	for field := range fields {
+		echoedValue, present := echoedMap[field]
+		if !present {
+			continue
+		}
+		advertisedValue, declared := advertisedMap[field]
+		if !declared || !DeepEqual(advertisedValue, echoedValue) {
+			return false
+		}
+	}
+	return true
+}
+
 // ExtensionValidationResult is returned by ValidateExtensions. Valid is true
 // when the client either omitted extensions or echoed every server-advertised
 // field; otherwise InvalidReason/ExtensionKey describe the mismatch.
@@ -915,7 +998,8 @@ type ExtensionValidationResult struct {
 // ValidateExtensions checks that the client-echoed extension info preserves the
 // server-advertised subset for every key the server declared. Clients may add
 // fields and may omit extension keys entirely, but may not drop or change a
-// server-advertised value.
+// server-advertised value. Fields listed in serverOwnedInfoFields may not be
+// added without a matching declaration.
 func (s *x402ResourceServer) ValidateExtensions(
 	serverExtensions map[string]interface{},
 	payload types.PaymentPayload,
@@ -923,7 +1007,7 @@ func (s *x402ResourceServer) ValidateExtensions(
 	if payload.X402Version != 2 {
 		return ExtensionValidationResult{Valid: true}
 	}
-	if len(serverExtensions) == 0 || len(payload.Extensions) == 0 {
+	if len(payload.Extensions) == 0 {
 		return ExtensionValidationResult{Valid: true}
 	}
 
@@ -941,40 +1025,24 @@ func (s *x402ResourceServer) ValidateExtensions(
 		field              string
 	}
 
-	// normalize converts a server-declared value (which may be a typed struct)
-	// into the generic JSON shape the echoed payload already uses.
-	// Falls back to the original value when it is not JSON-encodable.
-	normalize := func(v interface{}) interface{} {
-		encoded, err := json.Marshal(v)
-		if err != nil {
-			return v
-		}
-		var decoded interface{}
-		if err := json.Unmarshal(encoded, &decoded); err != nil {
-			return v
-		}
-		return decoded
-	}
-
 	for key, echoedValue := range payload.Extensions {
 		serverValue, declared := serverExtensions[key]
+		advertisedInfo := extensionInfo(serverValue)
+		echoedInfo := extensionInfo(echoedValue)
+		fields := serverOwnedInfoFields[key]
 		if !declared {
+			if len(fields) > 0 && !serverOwnedInfoFieldsMatch(advertisedInfo, echoedInfo, fields) {
+				return ExtensionValidationResult{
+					Valid:         false,
+					InvalidReason: "extension_echo_mismatch",
+					ExtensionKey:  key,
+				}
+			}
 			continue
 		}
 
-		// Compare the `info` envelope when present, otherwise the flat value.
-		advertised := normalize(serverValue)
-		if m, ok := advertised.(map[string]interface{}); ok {
-			if info, has := m["info"]; has {
-				advertised = info
-			}
-		}
-		echoed := echoedValue
-		if m, ok := echoedValue.(map[string]interface{}); ok {
-			if info, has := m["info"]; has {
-				echoed = info
-			}
-		}
+		advertised := advertisedInfo
+		echoed := echoedInfo
 
 		// Exclude fields the extension regenerates per response (e.g. nonces)
 		// so a fresh server value is not flagged against the client's echo.
@@ -1036,7 +1104,7 @@ func (s *x402ResourceServer) ValidateExtensions(
 			}
 		}
 
-		if mismatch {
+		if mismatch || (len(fields) > 0 && !serverOwnedInfoFieldsMatch(advertisedInfo, echoedInfo, fields)) {
 			return ExtensionValidationResult{
 				Valid:         false,
 				InvalidReason: "extension_echo_mismatch",
@@ -1069,6 +1137,14 @@ var additiveArrayInfoFields = map[string]map[string]bool{
 // from go/extensions/buildercode/types.go and must be kept in sync by hand.
 var additiveArrayMaxLengths = map[string]map[string]int{
 	"builder-code": {"s": 10},
+}
+
+// serverOwnedInfoFields lists extension info fields, keyed by extension key,
+// that clients may echo only when the resource server independently declared
+// the same value. Core cannot import extension packages, so these identifiers
+// are duplicated here alongside additiveArrayInfoFields.
+var serverOwnedInfoFields = map[string]map[string]struct{}{
+	"builder-code": {"a": {}},
 }
 
 // dynamicInfoFields returns the dynamic `info` field names declared by the
@@ -1226,7 +1302,15 @@ func (s *x402ResourceServer) VerifyPaymentWithExtensions(
 	// Handle IsValid: false — facilitator reachable but explicitly rejected the payment.
 	// Conflating "no network error" with "payment valid" is a security bug: an HTTP-200
 	// response carrying {"isValid":false} must be treated as a hard gate failure.
+	// Run afterVerify hooks so schemes can stash corrective state for 402 enrichment.
 	if verifyResult == nil || !verifyResult.IsValid {
+		if verifyResult != nil {
+			if afterRes, afterErr := s.runAfterVerifyHooks(payload, requirements, declaredExtensions, hookCtx, afterVerifyHooks, verifyResult); afterErr != nil {
+				return afterRes, afterErr
+			} else if afterRes != nil {
+				verifyResult = afterRes
+			}
+		}
 		reason := ErrCodeInvalidPayment
 		var payer, message string
 		if verifyResult != nil {
@@ -1237,13 +1321,6 @@ func (s *x402ResourceServer) VerifyPaymentWithExtensions(
 			message = verifyResult.InvalidMessage
 		}
 		ve := NewVerifyError(reason, payer, message)
-		failureCtx := VerifyFailureContext{VerifyContext: hookCtx, Error: ve}
-		for _, lh := range verifyFailureHooks {
-			result, _ := lh.Hook(failureCtx)
-			if result != nil && result.Recovered {
-				return s.runAfterVerifyHooks(payload, requirements, declaredExtensions, hookCtx, afterVerifyHooks, result.Result)
-			}
-		}
 		return verifyResult, ve
 	}
 
@@ -1295,6 +1372,70 @@ func (s *x402ResourceServer) runAfterVerifyHooks(
 	}
 
 	return verifyResult, nil
+}
+
+// settleWithPendingRetry calls facilitator.Settle once, then retries exactly
+// once with the identical payload/requirements bytes when the outcome is a
+// non-terminal settlement_pending failure carrying a broadcast transaction
+// hash. This sits above all scheme/network dispatch — the mechanism that
+// actually handles the retry (via its own PendingSettlementStore check, see
+// go/pending_settlement_store.go) reconciles against the already-broadcast
+// transaction instead of verifying and broadcasting a second one. No
+// mutation, backoff, or sleep: the mechanism layer owns any bounded waiting.
+// Any other outcome (success, or a different failure reason) short-circuits
+// after the first call. Capped at exactly one retry regardless of the second
+// outcome, so this can never loop.
+func settleWithPendingRetry(
+	ctx context.Context,
+	facilitator FacilitatorClient,
+	payloadBytes []byte,
+	requirementsBytes []byte,
+) (*SettleResponse, error) {
+	settleResult, settleErr := facilitator.Settle(ctx, payloadBytes, requirementsBytes)
+	if !isRetryableSettlementPending(settleResult, settleErr) {
+		return settleResult, settleErr
+	}
+	return facilitator.Settle(ctx, payloadBytes, requirementsBytes)
+}
+
+// isRetryableSettlementPending reports whether a settle outcome is a
+// retryable settlement_pending: either a thrown *SettleError (the local/
+// in-process FacilitatorClient path) or a returned SettleResponse with
+// success:false (the HTTP/remote FacilitatorClient path), in both cases with
+// errorReason=="settlement_pending" and a non-empty transaction hash.
+func isRetryableSettlementPending(result *SettleResponse, err error) bool {
+	if err != nil {
+		var se *SettleError
+		if errors.As(err, &se) {
+			return se.ErrorReason == ErrSettlementPending && se.Transaction != ""
+		}
+		return false
+	}
+	return result != nil && !result.Success &&
+		result.ErrorReason == ErrSettlementPending && result.Transaction != ""
+}
+
+// settleResponseToError synthesizes an error from a returned success:false
+// SettleResponse so it can flow through the same SettleFailureContext/
+// OnSettleFailureHook path as a thrown *SettleError. Mirrors Python's
+// `Exception(settle_result.error_reason or "Settlement failed")` fallback
+// (python/x402/server_base.py).
+func settleResponseToError(result *SettleResponse) error {
+	reason := result.ErrorReason
+	if reason == "" {
+		reason = "Settlement failed"
+	}
+	return NewSettleError(reason, result.Payer, result.Network, result.Transaction, result.ErrorMessage)
+}
+
+// applyAfterSettleAbort flips an onchain successful settle to success:false
+// when an afterSettle hook aborts. Transaction/amount/payer/onchain extra are
+// kept so callers retain proof funds moved.
+func applyAfterSettleAbort(result *SettleResponse, reason, message string) {
+	result.Success = false
+	result.ErrorReason = reason
+	result.ErrorMessage = message
+	result.AfterSettleAborted = true
 }
 
 // SettlePayment settles a V2 payment with no declared extensions.
@@ -1408,7 +1549,14 @@ func (s *x402ResourceServer) SettlePaymentWithExtensions(
 				// Execute afterSettle hooks even when skipping
 				skipResultCtx := SettleResultContext{SettleContext: hookCtx, Result: result.SkipResult}
 				for _, ah := range afterSettleHooks {
-					_ = ah.Hook(skipResultCtx)
+					if hookErr := ah.Hook(skipResultCtx); hookErr != nil {
+						var abort *AfterSettleAbortError
+						if errors.As(hookErr, &abort) {
+							applyAfterSettleAbort(result.SkipResult, abort.Reason, abort.Message)
+							break
+						}
+						log.Printf("[x402] afterSettle hook error: %v", hookErr)
+					}
 				}
 				return result.SkipResult, nil
 			}
@@ -1459,9 +1607,9 @@ func (s *x402ResourceServer) SettlePaymentWithExtensions(
 		return nil, NewSettleError("failed_to_marshal_payload", "", Network(effectiveRequirements.Network), "", err.Error())
 	}
 
-	settleResult, settleErr := facilitator.Settle(ctx, payloadBytes, requirementsBytes)
+	settleResult, settleErr := settleWithPendingRetry(ctx, facilitator, payloadBytes, requirementsBytes)
 
-	// Handle failure
+	// Handle failure (thrown error from a local/in-process facilitator).
 	if settleErr != nil {
 		failureCtx := SettleFailureContext{SettleContext: hookCtx, Error: settleErr}
 		for _, lh := range settleFailureHooks {
@@ -1473,10 +1621,37 @@ func (s *x402ResourceServer) SettlePaymentWithExtensions(
 		return settleResult, settleErr
 	}
 
+	// A returned (non-thrown) settleResult with success:false — e.g. from a
+	// remote/HTTP facilitator — silently looked like a success before this
+	// check: afterSettle hooks would run and callers would treat the response
+	// as settled. Route it through onSettleFailure like a thrown error so
+	// hooks get a chance to recover, matching the Python SDK.
+	if settleResult != nil && !settleResult.Success {
+		failureCtx := SettleFailureContext{SettleContext: hookCtx, Error: settleResponseToError(settleResult)}
+		for _, lh := range settleFailureHooks {
+			result, _ := lh.Hook(failureCtx)
+			if result != nil && result.Recovered {
+				return result.Result, nil
+			}
+		}
+		return settleResult, nil
+	}
+
 	// Execute afterSettle hooks
 	resultCtx := SettleResultContext{SettleContext: hookCtx, Result: settleResult}
 	for _, lh := range afterSettleHooks {
-		_ = lh.Hook(resultCtx) // Log errors but don't fail
+		if hookErr := lh.Hook(resultCtx); hookErr != nil {
+			var abort *AfterSettleAbortError
+			if errors.As(hookErr, &abort) {
+				if settleResult == nil {
+					return nil, NewSettleError(abort.Reason, "", network, "", abort.Message)
+				}
+				applyAfterSettleAbort(settleResult, abort.Reason, abort.Message)
+				// Enrichment must not replace the aborted receipt, which carries the onchain transaction.
+				return settleResult, nil
+			}
+			log.Printf("[x402] afterSettle hook error: %v", hookErr)
+		}
 	}
 
 	// Scheme-level settlement-response enrichment. Mirrors TS
@@ -1614,7 +1789,7 @@ func (s *x402ResourceServer) BuildPaymentRequirementsFromConfig(ctx context.Cont
 
 	// Check each cached facilitator response for matching supported kind
 	s.supportedCache.mu.RLock()
-	for _, cachedResponse := range s.supportedCache.data {
+	for _, cachedResponse := range s.supportedCache.snapshotLocked() {
 		// Iterate through flat kinds array (version is in each element)
 		for _, kind := range cachedResponse.Kinds {
 			// Match on scheme and network (only check V2 kinds)

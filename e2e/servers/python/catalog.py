@@ -103,6 +103,8 @@ class CatalogRoute:
     price: dict[str, Any]
     extensions: list[str]
     settlement_override: dict[str, str] | None
+    payment_flow: str | None
+    scheme_extra: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +117,7 @@ class ResolvedRoute:
     network: str
     pay_to: str
     price: Any
-    extra: dict[str, str] | None
+    extra: dict[str, Any] | None
     extensions: list[str] = field(default_factory=list)
     settlement_override: dict[str, str] | None = None
 
@@ -146,9 +148,21 @@ def _route_filter() -> tuple[set[str], set[str]]:
     return parse("E2E_EXCLUDE_SCHEMES"), parse("E2E_EXCLUDE_NETWORKS")
 
 
+def _batch_server_role() -> str:
+    """Harness-assigned custody role for this server process (defaults to standard)."""
+    return (os.getenv("E2E_BATCH_SERVER_ROLE", "").strip().lower() or "standard")
+
+
+def _is_managed_batch(definition: dict[str, Any]) -> bool:
+    return definition.get("scheme") == "batch-settlement" and bool(
+        (definition.get("schemeOptions") or {}).get("facilitatorManaged")
+    )
+
+
 def catalog_routes() -> list[CatalogRoute]:
     """Routes this SDK implements, after applying the harness exclusions."""
     excluded_schemes, excluded_networks = _route_filter()
+    role = _batch_server_role()
     routes: list[CatalogRoute] = []
 
     for path, definition in _CATALOG["routes"].items():
@@ -156,6 +170,12 @@ def catalog_routes() -> list[CatalogRoute]:
             continue
         network = definition["network"]
         if definition["scheme"] in excluded_schemes or network in excluded_networks:
+            continue
+        managed = _is_managed_batch(definition)
+        if role == "managed-batch":
+            if not managed:
+                continue
+        elif managed:
             continue
         routes.append(
             CatalogRoute(
@@ -166,6 +186,8 @@ def catalog_routes() -> list[CatalogRoute]:
                 price=definition["price"],
                 extensions=list(definition.get("extensions", [])),
                 settlement_override=definition.get("settlementOverride"),
+                payment_flow=definition.get("paymentFlow"),
+                scheme_extra=definition.get("schemeExtra"),
             )
         )
 
@@ -258,6 +280,23 @@ def _resolve_price(
     return price, None
 
 
+def _merge_route_extra(
+    price_extra: dict[str, str] | None,
+    payment_flow: str | None,
+) -> dict[str, str] | None:
+    """Merge price-derived extra with catalog paymentFlow.
+
+    Authorization is omitted on the wire, matching core applyPaymentFlowWireExtra.
+    """
+    wire_flow = payment_flow if payment_flow and payment_flow != "authorization" else None
+    if not wire_flow and not price_extra:
+        return None
+    extra = dict(price_extra or {})
+    if wire_flow:
+        extra["paymentFlow"] = wire_flow
+    return extra
+
+
 def resolve_routes(env: Callable[[str], str | None] = os.getenv) -> list[ResolvedRoute]:
     """Resolve catalog routes for one server process.
 
@@ -274,6 +313,9 @@ def resolve_routes(env: Callable[[str], str | None] = os.getenv) -> list[Resolve
 
         caip2 = network_caip2(route.network, env)
         price, extra = _resolve_price(route, caip2, env)
+        extra = _merge_route_extra(extra, route.payment_flow)
+        if route.scheme_extra:
+            extra = {**(extra or {}), **route.scheme_extra}
 
         resolved.append(
             ResolvedRoute(
@@ -328,6 +370,7 @@ def route_description(
     scheme: str,
     asset_transfer_method: str | None,
     extensions: list[str] | None,
+    payment_flow: str | None = None,
 ) -> str:
     """Human-readable description for an MCP tool, mirroring the TS catalog helper."""
     label = network_id.upper()
@@ -339,7 +382,10 @@ def route_description(
         if ext_id in _GAS_SPONSORING_LABELS
     ]
     suffix = f" with {' and '.join(sponsoring)}" if sponsoring else ""
-    return f"Protected {scheme_prefix}{transfer}endpoint on {label}{suffix}"
+    flow = ""
+    if payment_flow and payment_flow != "authorization":
+        flow = f" {payment_flow}"
+    return f"Protected {scheme_prefix}{transfer}endpoint on {label}{flow}{suffix}"
 
 
 def route_discovery_output() -> dict[str, Any]:

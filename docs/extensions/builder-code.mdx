@@ -18,6 +18,7 @@ Three parties each contribute an attribution code:
 | `a` | Resource server | App code — identifies the application exposing the paid endpoint |
 | `w` | Facilitator | Wallet code — identifies the facilitator settling the payment on-chain |
 | `s` | Client, server, and/or facilitator | Service code(s) — attribution codes from the payment path; each party has its own dedicated reservation (`MAX_CLIENT_SERVICE_CODES`, `MAX_SERVER_SERVICE_CODES`, `MAX_FACILITATOR_SERVICE_CODES`) so declaring up to that amount never crowds out another party's codes |
+| `m` | Facilitator (at settlement) | Settlement metadata — facilitator-authored key/value map supplied by the settling mechanism; keys must start with `x402` and values must be unsigned integers, strings, arrays, or maps with string keys |
 
 These codes are CBOR-encoded as an [ERC-8021](https://eip.tools/eip/8021) Schema 2 suffix and appended to the settlement transaction calldata. Off-chain tools can parse the calldata to verify attribution.
 
@@ -337,7 +338,7 @@ const tx = await publicClient.getTransaction({ hash: txHash });
 const attribution = parseBuilderCodeSuffixFromCalldata(tx.input);
 
 console.log(attribution);
-// { a: "bc_my_app", s: ["bc_my_client"], w: "bc_my_facilitator" }
+// { a: "bc_my_app", s: ["bc_my_client"], w: "bc_my_facilitator", m: { x402Example: 7n } }
 ```
 
 ## ERC-8021 Schema 2 Calldata Format
@@ -349,7 +350,7 @@ The suffix appended to settlement calldata (reading from the end backwards):
 | `ercMarker` | 16 bytes | Constant: `80218021802180218021802180218021` |
 | `schemaId` | 1 byte | `0x02` for Schema 2 |
 | `cborLength` | 2 bytes | Length of CBOR data (big-endian) |
-| `cborData` | variable | CBOR-encoded map with `a`, `w`, and/or `s` fields |
+| `cborData` | variable | CBOR-encoded map with `a`, `w`, `s`, and/or `m` fields |
 
 Wire order: `[cborData][cborLength (2B)][schemaId (1B)][ercMarker (16B)]`
 
@@ -392,7 +393,9 @@ client.registerExtension(new BuilderCodeClientExtension(["bc_mcp_server", "bc_my
 
 Accepts a single string or an array of strings. Attaches the client's `s` code(s) to every payment payload when registered. When the server declared `builder-code`, the core client merge also preserves the server's `a` code, concatenating any server-declared `s` with the client's (client entries first). Multiple codes are useful for layered clients (e.g. an MCP server acting as middleware) that need to attribute multiple participants. Throws if more than `MAX_CLIENT_SERVICE_CODES` codes are given.
 
-<Note>`s` is split into dedicated, non-overlapping reservations: up to `MAX_CLIENT_SERVICE_CODES` (**5**) for the client, `MAX_SERVER_SERVICE_CODES` (**5**) for the server, and `MAX_FACILITATOR_SERVICE_CODES` (**1**) for the facilitator's own code — a total of `MAX_SERVICE_CODES` (**11**). `declareBuilderCodeExtension`, `BuilderCodeClientExtension`, and the facilitator's `serviceCode` config each reject more entries than their own reservation, so no compliant combination can crowd out another party's codes. The resource server also rejects a client echo whose combined `s` exceeds the client+server budget (**10**) before settlement, and facilitators additionally truncate to that same budget as a defensive backstop against a malformed payload sent directly to a facilitator.</Note>
+<Note>`s` is split into dedicated, non-overlapping reservations: up to `MAX_CLIENT_SERVICE_CODES` (**5**) for the client, `MAX_SERVER_SERVICE_CODES` (**5**) for the server, and `MAX_FACILITATOR_SERVICE_CODES` (**1**) for the facilitator's own code — a total of `MAX_SERVICE_CODES` (**11**). `declareBuilderCodeExtension`, `BuilderCodeClientExtension`, and the facilitator's `serviceCode` config each reject more entries than their own reservation, so no compliant combination can crowd out another party's codes. The resource server also rejects a client echo whose combined `s` exceeds the client+server budget (**10**) before settlement, and facilitators additionally truncate to that same budget as a defensive backstop against a malformed payload sent directly to a facilitator.
+
+`a` is a server-owned field: on v2 payloads, the resource server rejects the payment (`extension_echo_mismatch`) if the client echoes an `a` value that doesn't exactly match the server's advertised value, or if the client sets `a` when the server did not declare `builder-code` at all. Clients must only echo `a` when the server declared it, and must use the exact value from the `PaymentRequired` response.</Note>
 
 ### Facilitator
 
@@ -409,18 +412,25 @@ facilitator.registerExtension(
 );
 ```
 
-Reads `a` and `s` from the payment payload at settlement time, adds `w`, appends its own `serviceCode` to `s` (deduped), and encodes the ERC-8021 CBOR suffix.
+Reads `a` and `s` from the payment payload at settlement time, adds `w`, appends its own `serviceCode` to `s` (deduped), includes `m` when the settling mechanism supplies settlement metadata, and encodes the ERC-8021 CBOR suffix. On v1 payloads, `a` is omitted from the suffix (the resource-server echo gate that validates `a` does not run on v1).
+
+The `m` field is written exclusively by the facilitator at settlement — it never appears in `PaymentRequired` or `PaymentPayload`, and the facilitator ignores any `m` found in a client payload. Keys inside `m` must start with `x402` and are defined by the scheme spec that emits them.
 
 ### Utilities
 
 #### `encodeBuilderCodeSuffix(data)`
 
-Encodes builder code fields as an ERC-8021 Schema 2 hex suffix.
+Encodes builder code fields as an ERC-8021 Schema 2 hex suffix. Accepts `a`, `w`, `s`, and `m` fields. Throws when the resulting CBOR exceeds 65,535 bytes.
 
 ```typescript
 import { encodeBuilderCodeSuffix } from "@x402/extensions/builder-code";
 
-const suffix = encodeBuilderCodeSuffix({ a: "bc_my_app", w: "bc_my_fac", s: ["bc_my_client"] });
+const suffix = encodeBuilderCodeSuffix({
+  a: "bc_my_app",
+  w: "bc_my_fac",
+  s: ["bc_my_client"],
+  m: { x402Example: 7n },
+});
 // Returns hex string to append to calldata
 ```
 
@@ -432,7 +442,8 @@ Parses ERC-8021 Schema 2 attribution from settlement transaction calldata.
 import { parseBuilderCodeSuffixFromCalldata } from "@x402/extensions/builder-code";
 
 const attribution = parseBuilderCodeSuffixFromCalldata(tx.input);
-// Returns { a?, w?, s? } or null if no valid suffix found
+// Returns { a?, w?, s?, m? } or null if no valid suffix found
+// Unsigned integers inside `m` are returned as bigint
 ```
 
 ### Constants
@@ -449,6 +460,8 @@ import {
   SCHEMA_2_ID,                     // 0x02
 } from "@x402/extensions/builder-code";
 ```
+
+Types exported include `BuilderCodeExtensionData`, `BuilderCodeSuffixData` (extends `BuilderCodeExtensionData` with `m?`), `SettlementMetadata`, `BuilderCodeFacilitatorConfig`, `BuilderCodeRequiredExtension`, and `DataSuffixContext`.
 
 ## Examples
 

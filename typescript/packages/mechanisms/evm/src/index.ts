@@ -78,6 +78,13 @@ export {
   claimBatchTypes,
 } from "./batch-settlement/constants";
 
+export {
+  DEFAULT_ASSET_CONTRACT_CACHE_TTL_MS,
+  resetAssetContractCache,
+  startAssetContractCheck,
+  validateAssetIsContract,
+} from "./assetCache";
+
 export { getDefaultAsset, findDefaultAsset } from "./defaultAssets";
 export type { DefaultAssetInfo, ExactDefaultAssetInfo } from "./defaultAssets";
 
@@ -100,6 +107,8 @@ export {
   verifyHashSignature,
   verifyHashSignatureWithCode,
   classifyErc6492Payer,
+  isCanonicalEcdsaSignature,
+  isPlainNonCanonicalEcdsaSignature,
 } from "./shared/verifySignature";
 export type { Erc6492Classification } from "./shared/verifySignature";
 
@@ -134,7 +143,12 @@ export { isAuthCaptureExtra, isAuthCapturePayload } from "./auth-capture/types";
 // AuthCapture constants
 export {
   AUTH_CAPTURE_ESCROW_ADDRESS,
+  AUTH_CAPTURE_ESCROW_V1_0_ADDRESS,
+  AUTH_CAPTURE_ESCROW_V1_1_ADDRESS,
   AUTH_CAPTURE_SCHEME,
   EIP3009_TOKEN_COLLECTOR_ADDRESS,
+  EIP3009_TOKEN_COLLECTOR_V1_0_ADDRESS,
+  OPERATOR_REFUND_COLLECTOR_ADDRESS,
   PERMIT2_TOKEN_COLLECTOR_ADDRESS,
+  resolveAuthCaptureDeployment,
 } from "./auth-capture/constants";
