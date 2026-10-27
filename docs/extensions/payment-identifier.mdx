@@ -177,47 +177,47 @@ paymentID = paymentidentifier.GeneratePaymentID("order_")
 
 ### Step 2: Add Payment ID to Extensions
 
-Hook into the payment flow to add the payment ID before payload creation:
+`PaymentCreationContext` has `Ctx`, `Version`, and `SelectedRequirements`. It has no `Extensions` field, so `OnBeforePaymentCreation` cannot see or modify the server declaration. Register a client extension and append the identifier from `EnrichPaymentPayload`. Pass an empty id and `AppendPaymentIdentifierToExtensions` mints a new one for that payload. The HTTP client then builds a fresh payment credential. Do not cache `PAYMENT-SIGNATURE`, and do not reuse one identifier across purchases.
 
 ```go
 import (
+    "context"
+
     x402 "github.com/x402-foundation/x402/go/v2"
     "github.com/x402-foundation/x402/go/v2/extensions/paymentidentifier"
 )
 
-client := x402.Newx402Client()
-// ... register schemes ...
+type paymentIdentifierExtension struct{}
 
-// Generate a unique payment ID for this logical request
-paymentID := paymentidentifier.GeneratePaymentID("")
+func (paymentIdentifierExtension) Key() string {
+    return paymentidentifier.PAYMENT_IDENTIFIER
+}
 
-// Hook into payment flow to add the payment ID
-client.OnBeforePaymentCreation(func(ctx x402.PaymentCreationContext) (*x402.BeforePaymentCreationHookResult, error) {
-    if ctx.Extensions == nil {
-        return nil, nil
+func (paymentIdentifierExtension) EnrichPaymentPayload(
+    _ context.Context,
+    payload x402.PaymentPayload,
+    required x402.PaymentRequired,
+) (x402.PaymentPayload, error) {
+    extensions := map[string]interface{}{}
+    for key, value := range payload.Extensions {
+        extensions[key] = value
     }
-
-    // Only add if server declared the extension
-    if ctx.Extensions[paymentidentifier.PAYMENT_IDENTIFIER] == nil {
-        return nil, nil
+    if _, ok := extensions[paymentidentifier.PAYMENT_IDENTIFIER]; !ok && required.Extensions != nil {
+        if declared, ok := required.Extensions[paymentidentifier.PAYMENT_IDENTIFIER]; ok {
+            extensions[paymentidentifier.PAYMENT_IDENTIFIER] = declared
+        }
     }
-
-    err := paymentidentifier.AppendPaymentIdentifierToExtensions(ctx.Extensions, paymentID)
-    if err != nil {
-        return nil, err
+    if err := paymentidentifier.AppendPaymentIdentifierToExtensions(extensions, ""); err != nil {
+        return payload, err
     }
+    payload.Extensions = extensions
+    return payload, nil
+}
 
-    return nil, nil
-})
-
+client := x402.Newx402Client().RegisterExtension(paymentIdentifierExtension{})
 ```
 
-This Go fragment only injects the logical payment ID. It does not implement an
-HTTP request or safe credential replay. The Go client does not yet include the
-audited immutable-URL, accepted-terms-bound header replay helper shown for
-TypeScript and Python. Until that helper and its adversarial tests exist, use a
-fresh payment credential for each Go request and do not describe a repeated ID
-as a cache hit.
+This fragment injects one new payment identifier per payload when the server declared the extension. It does not capture or replay a payment header. The Go example issues one purchase. The SDK still sends its unpaid probe and one payment retry, and that retry carries a fresh credential. The example does not implement the TypeScript and Python exact-header replay helper, and it does not establish exactly-once effects. A second purchase needs another request, another identifier, and another credential.
 
 </Tab>
 </Tabs>
@@ -225,10 +225,10 @@ as a cache hit.
 ### Best Practices
 
 1. **Generate payment IDs at the logical request level**, not per retry
-2. **Keep the payment ID and captured exact header together only in the bounded in-memory retry helper.** These examples do not support restart recovery. Persisting a raw payment credential requires a separate encrypted-storage design and threat review; persisting the ID alone creates a fresh credential and conflicts with credential-bound server state.
+2. **TypeScript and Python keep the payment ID and captured exact header together only in the bounded in-memory retry helper.** The Go client does not capture a header. These examples do not support restart recovery. Persisting a raw payment credential requires a separate encrypted-storage design and threat review; persisting the ID alone creates a fresh credential and conflicts with credential-bound server state.
 3. **Use descriptive prefixes** (e.g., `generatePaymentId("order_")`) to identify payment types
 4. **Don't reuse payment IDs** across different logical requests
-5. **Replay the captured payment header only for the configured exact request URL and selected accepted terms.** Configure one helper per URL. Do not infer capture from a shared pending URL: `PaymentCreatedContext` has no request URL, so concurrent 402s cannot be correlated. A non-target 402 before capture fails closed. Do not replay it cross-origin, cross-path, across query drift, or against a 402 that no longer offers those terms. Do not log or persist the raw header.
+5. **TypeScript and Python replay the captured payment header only for the configured exact request URL and selected accepted terms.** Configure one helper per URL. Do not infer capture from a shared pending URL: `PaymentCreatedContext` has no request URL, so concurrent 402s cannot be correlated. A non-target 402 before capture fails closed. Do not replay it cross-origin, cross-path, across query drift, or against a 402 that no longer offers those terms. Do not log or persist the raw header. The Go client has no replay helper: each Go purchase uses a new identifier and a fresh SDK credential.
 
 ## Quickstart for Sellers (Servers)
 
