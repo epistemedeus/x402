@@ -11,6 +11,8 @@ This example attaches a payment identifier to one logical purchase. The x402 HTT
 
 `PaymentCreationContext` contains `Ctx`, `Version`, and `SelectedRequirements`. It has no `Extensions` field. `OnBeforePaymentCreation` cannot inject the identifier.
 
+The scheme method is `CreatePaymentPayload(ctx, requirements, payloadCtx)`. `payloadCtx` is a `PaymentPayloadContext`: the server extension map and the resolved spend cap. This example disables spend controls, so the cap is empty. `EnrichPaymentPayload` appends the identifier after the scheme returns.
+
 A second purchase is a different request. Give it a new identifier and let the SDK create a new credential. Reusing one identifier with a new credential conflicts with credential-bound server state. TypeScript and Python examples can replay one captured header for one immutable URL and one selected set of accepted terms. This Go example does not.
 
 ## Prerequisites

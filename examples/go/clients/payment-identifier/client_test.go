@@ -45,13 +45,32 @@ func (r *recorder) snapshot() []hit {
 	return out
 }
 
+// recordedPayloadContext is what the scheme observed on one CreatePaymentPayload call.
+// Fields are copied at the call so later extension enrichment cannot change the record.
+type recordedPayloadContext struct {
+	maxAmount           string
+	paymentIdentifierOK bool
+}
+
 type mockExactScheme struct {
-	n atomic.Int64
+	n    atomic.Int64
+	mu   sync.Mutex
+	seen []recordedPayloadContext
 }
 
 func (m *mockExactScheme) Scheme() string { return "exact" }
 
-func (m *mockExactScheme) CreatePaymentPayload(_ context.Context, _ x402.PaymentRequirements) (x402.PaymentPayload, error) {
+// CreatePaymentPayload matches current-main SchemeNetworkClient: the third
+// argument is PaymentPayloadContext (server extensions and resolved spend cap).
+func (m *mockExactScheme) CreatePaymentPayload(_ context.Context, _ x402.PaymentRequirements, payloadCtx x402.PaymentPayloadContext) (x402.PaymentPayload, error) {
+	recorded := recordedPayloadContext{maxAmount: payloadCtx.MaxAmountPerPayment}
+	if ext, ok := payloadCtx.Extensions[paymentidentifier.PAYMENT_IDENTIFIER]; ok {
+		recorded.paymentIdentifierOK = paymentidentifier.IsPaymentIdentifierExtension(ext)
+	}
+	m.mu.Lock()
+	m.seen = append(m.seen, recorded)
+	m.mu.Unlock()
+
 	n := m.n.Add(1)
 	return x402.PaymentPayload{
 		X402Version: 2,
@@ -59,18 +78,28 @@ func (m *mockExactScheme) CreatePaymentPayload(_ context.Context, _ x402.Payment
 	}, nil
 }
 
+func (m *mockExactScheme) contexts() []recordedPayloadContext {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]recordedPayloadContext, len(m.seen))
+	copy(out, m.seen)
+	return out
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func testClient(ext *paymentIdentifierExtension, transport http.RoundTripper) *http.Client {
+func testClient(ext *paymentIdentifierExtension, transport http.RoundTripper) (*http.Client, *mockExactScheme) {
 	if ext == nil {
 		ext = &paymentIdentifierExtension{}
 	}
+	scheme := &mockExactScheme{}
 	core := x402.Newx402Client().DisableSpendControls().
-		Register("eip155:*", &mockExactScheme{}).
+		Register("eip155:*", scheme).
 		RegisterExtension(ext)
-	return x402http.WrapHTTPClientWithPayment(&http.Client{Transport: transport}, x402http.Newx402HTTPClient(core))
+	client := x402http.WrapHTTPClientWithPayment(&http.Client{Transport: transport}, x402http.Newx402HTTPClient(core))
+	return client, scheme
 }
 
 func paymentRequiredHeader(t *testing.T, amount string, extension interface{}) string {
@@ -212,7 +241,7 @@ func TestIdentifierInjectedOn402AndSDKRetryOnly(t *testing.T) {
 		return http.DefaultTransport.RoundTrip(r)
 	})
 	srv, rec := newOfferServer(t, declaredExtension(), fixedAmount("1000"))
-	client := testClient(ext, transport)
+	client, scheme := testClient(ext, transport)
 
 	status, body, err := doJSON(t, client, http.MethodPost, srv.URL+"/order?item=widget", `{"item":"widget"}`, map[string]string{"X-Trace": "keep"})
 	if err != nil {
@@ -250,11 +279,21 @@ func TestIdentifierInjectedOn402AndSDKRetryOnly(t *testing.T) {
 	if payload.Payload["nonce"] != float64(1) {
 		t.Fatalf("payload nonce = %v, want a fresh scheme payload", payload.Payload["nonce"])
 	}
+	seen := scheme.contexts()
+	if len(seen) != 1 {
+		t.Fatalf("scheme CreatePaymentPayload calls = %d, want 1", len(seen))
+	}
+	if seen[0].maxAmount != "" {
+		t.Fatalf("spend cap = %q, want empty when spend controls are disabled", seen[0].maxAmount)
+	}
+	if !seen[0].paymentIdentifierOK {
+		t.Fatal("scheme PaymentPayloadContext did not include the declared payment-identifier extension")
+	}
 }
 
 func TestSameTargetDoesNotReplayCredential(t *testing.T) {
 	srv, rec := newOfferServer(t, declaredExtension(), fixedAmount("1000"))
-	client := testClient(nil, nil)
+	client, _ := testClient(nil, nil)
 	const body = `{"item":"widget"}`
 	for i := 0; i < 2; i++ {
 		status, _, err := doJSON(t, client, http.MethodPost, srv.URL+"/order", body, nil)
@@ -291,7 +330,7 @@ func TestSameTargetDoesNotReplayCredential(t *testing.T) {
 
 func TestNoCredentialReplayAcrossURLOrQuery(t *testing.T) {
 	srv, rec := newOfferServer(t, declaredExtension(), fixedAmount("1000"))
-	client := testClient(nil, nil)
+	client, _ := testClient(nil, nil)
 	targets := []string{
 		srv.URL + "/order",
 		srv.URL + "/order?x=1",
@@ -336,7 +375,7 @@ func TestNoCredentialReplayAcrossURLOrQuery(t *testing.T) {
 
 func TestNoCredentialReplayWhenMethodOrBodyChanges(t *testing.T) {
 	srv, rec := newOfferServer(t, declaredExtension(), fixedAmount("1000"))
-	client := testClient(nil, nil)
+	client, _ := testClient(nil, nil)
 	requests := []struct {
 		method string
 		body   string
@@ -402,7 +441,7 @@ func TestNoCredentialReplayWhenOfferedTermsChange(t *testing.T) {
 		}
 		return amounts[i]
 	})
-	client := testClient(nil, nil)
+	client, _ := testClient(nil, nil)
 	for range amounts {
 		status, _, err := doJSON(t, client, http.MethodPost, srv.URL+"/order", `{"item":"widget"}`, nil)
 		if err != nil {
@@ -437,7 +476,7 @@ func TestNonExtensionNon402AndMalformedExtension(t *testing.T) {
 	t.Run("no extension", func(t *testing.T) {
 		ext := &paymentIdentifierExtension{}
 		srv, rec := newOfferServer(t, nil, fixedAmount("1000"))
-		client := testClient(ext, nil)
+		client, _ := testClient(ext, nil)
 		status, _, err := doJSON(t, client, http.MethodPost, srv.URL+"/order", `{"item":"widget"}`, nil)
 		if err != nil {
 			t.Fatalf("request: %v", err)
@@ -461,7 +500,7 @@ func TestNonExtensionNon402AndMalformedExtension(t *testing.T) {
 	t.Run("malformed extension", func(t *testing.T) {
 		ext := &paymentIdentifierExtension{}
 		srv, rec := newOfferServer(t, "not-a-valid-extension", fixedAmount("1000"))
-		client := testClient(ext, nil)
+		client, _ := testClient(ext, nil)
 		status, _, err := doJSON(t, client, http.MethodGet, srv.URL+"/order", "", nil)
 		if err != nil {
 			t.Fatalf("request: %v", err)
@@ -504,7 +543,7 @@ func TestNonExtensionNon402AndMalformedExtension(t *testing.T) {
 		}))
 		t.Cleanup(srv.Close)
 		ext := &paymentIdentifierExtension{}
-		client := testClient(ext, transport)
+		client, _ := testClient(ext, transport)
 		status, _, err := doJSON(t, client, http.MethodGet, srv.URL+"/health", "", map[string]string{"X-Trace": "plain"})
 		if err != nil {
 			t.Fatalf("request: %v", err)
@@ -536,7 +575,7 @@ func TestExplicitCredentialIsNotCached(t *testing.T) {
 		_, _ = w.Write([]byte("ok"))
 	}))
 	t.Cleanup(srv.Close)
-	client := testClient(nil, nil)
+	client, _ := testClient(nil, nil)
 
 	status, _, err := doJSON(t, client, http.MethodPost, srv.URL+"/order", `{"item":"widget"}`, map[string]string{
 		"PAYMENT-SIGNATURE": "explicit-credential",
@@ -600,7 +639,7 @@ func TestExplicitCredentialDoesNotStickWhenServerStillRequiresPayment(t *testing
 	}))
 	t.Cleanup(srv.Close)
 
-	client := testClient(nil, nil)
+	client, _ := testClient(nil, nil)
 	status, body, err := doJSON(t, client, http.MethodPost, srv.URL+"/order", `{"item":"widget"}`, map[string]string{
 		"PAYMENT-SIGNATURE": "explicit-credential",
 		"X-Trace":           "keep",
@@ -643,7 +682,7 @@ func TestExplicitCredentialDoesNotStickWhenServerStillRequiresPayment(t *testing
 func TestInvalidIdentifierDoesNotSendCredential(t *testing.T) {
 	ext := &paymentIdentifierExtension{nextID: func() string { return "short" }}
 	srv, rec := newOfferServer(t, declaredExtension(), fixedAmount("1000"))
-	client := testClient(ext, nil)
+	client, _ := testClient(ext, nil)
 	_, _, err := doJSON(t, client, http.MethodPost, srv.URL+"/order", `{"item":"widget"}`, nil)
 	if err == nil || !strings.Contains(err.Error(), "invalid payment ID") {
 		t.Fatalf("error = %v, want invalid payment ID", err)
@@ -662,7 +701,7 @@ func TestInvalidIdentifierDoesNotSendCredential(t *testing.T) {
 
 func TestConcurrentPurchasesDoNotShareCredentialOrIdentifier(t *testing.T) {
 	srv, rec := newOfferServer(t, declaredExtension(), fixedAmount("1000"))
-	client := testClient(nil, nil)
+	client, _ := testClient(nil, nil)
 	var wg sync.WaitGroup
 	errCh := make(chan error, 8)
 	for i := 0; i < 8; i++ {
@@ -713,8 +752,9 @@ func TestConcurrentPurchasesDoNotShareCredentialOrIdentifier(t *testing.T) {
 
 func TestCreatePaymentPayloadMintsDistinctIdentifiers(t *testing.T) {
 	ext := &paymentIdentifierExtension{}
+	scheme := &mockExactScheme{}
 	core := x402.Newx402Client().DisableSpendControls().
-		Register("eip155:*", &mockExactScheme{}).
+		Register("eip155:*", scheme).
 		RegisterExtension(ext)
 	requirements := []x402.PaymentRequirements{
 		{
@@ -754,5 +794,17 @@ func TestCreatePaymentPayloadMintsDistinctIdentifiers(t *testing.T) {
 	}
 	if ids[0] == "" || ids[0] == ids[1] {
 		t.Fatalf("ids = %q, want distinct fresh identifiers", ids)
+	}
+	seen := scheme.contexts()
+	if len(seen) != len(requirements) {
+		t.Fatalf("scheme calls = %d, want %d", len(seen), len(requirements))
+	}
+	for i, ctx := range seen {
+		if ctx.maxAmount != "" {
+			t.Fatalf("call %d spend cap = %q, want empty when spend controls are disabled", i, ctx.maxAmount)
+		}
+		if !ctx.paymentIdentifierOK {
+			t.Fatalf("call %d PaymentPayloadContext missing payment-identifier", i)
+		}
 	}
 }
