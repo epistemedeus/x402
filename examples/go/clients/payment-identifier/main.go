@@ -29,6 +29,8 @@ import (
 //
 // PaymentCreationContext has Ctx, Version, and SelectedRequirements. It has no
 // Extensions field, so OnBeforePaymentCreation cannot carry the identifier.
+// The scheme receives PaymentPayloadContext (server extensions and the spend
+// cap). This extension appends the identifier after the scheme returns.
 // main calls the HTTP client once. The SDK still sends its unpaid probe and
 // one payment retry. This client does not cache PAYMENT-SIGNATURE for a later
 // purchase, and it does not establish exactly-once effects.

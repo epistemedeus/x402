@@ -177,7 +177,7 @@ paymentID = paymentidentifier.GeneratePaymentID("order_")
 
 ### Step 2: Add Payment ID to Extensions
 
-`PaymentCreationContext` has `Ctx`, `Version`, and `SelectedRequirements`. It has no `Extensions` field, so `OnBeforePaymentCreation` cannot see or modify the server declaration. Register a client extension and append the identifier from `EnrichPaymentPayload`. Pass an empty id and `AppendPaymentIdentifierToExtensions` mints a new one for that payload. The HTTP client then builds a fresh payment credential. Do not cache `PAYMENT-SIGNATURE`, and do not reuse one identifier across purchases.
+`PaymentCreationContext` has `Ctx`, `Version`, and `SelectedRequirements`. It has no `Extensions` field, so `OnBeforePaymentCreation` cannot see or modify the server declaration. The scheme method is `CreatePaymentPayload(ctx, requirements, payloadCtx)`. `payloadCtx` is a `PaymentPayloadContext` with the server extension map and the resolved spend cap. Register a client extension and append the identifier from `EnrichPaymentPayload` after the scheme returns. Pass an empty id and `AppendPaymentIdentifierToExtensions` mints a new one for that payload. The HTTP client then builds a fresh payment credential. Do not cache `PAYMENT-SIGNATURE`, and do not reuse one identifier across purchases.
 
 ```go
 import (
