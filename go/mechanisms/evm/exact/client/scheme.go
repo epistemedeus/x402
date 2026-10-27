@@ -12,13 +12,15 @@ import (
 	"github.com/x402-foundation/x402/go/v2/extensions/eip2612gassponsor"
 	"github.com/x402-foundation/x402/go/v2/extensions/erc20approvalgassponsor"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/evm"
+	"github.com/x402-foundation/x402/go/v2/mechanisms/evm/internal/clientutil"
 	"github.com/x402-foundation/x402/go/v2/types"
 )
 
 // ExactEvmScheme implements the SchemeNetworkClient interface for EVM exact payments (V2)
 type ExactEvmScheme struct {
-	signer evm.ClientEvmSigner
-	config *ExactEvmSchemeConfig
+	signer   evm.ClientEvmSigner
+	config   *ExactEvmSchemeConfig
+	warnings *clientutil.WarningSet
 }
 
 // NewExactEvmScheme creates a new ExactEvmScheme.
@@ -26,8 +28,9 @@ type ExactEvmScheme struct {
 // Extension enrichment paths use optional runtime capabilities.
 func NewExactEvmScheme(signer evm.ClientEvmSigner, config *ExactEvmSchemeConfig) *ExactEvmScheme {
 	return &ExactEvmScheme{
-		signer: signer,
-		config: config,
+		signer:   signer,
+		config:   config,
+		warnings: &clientutil.WarningSet{},
 	}
 }
 
@@ -47,31 +50,15 @@ func (c *ExactEvmScheme) FindDefaultAsset(asset string, network x402.Network) *x
 // CreatePaymentPayload creates a V2 payment payload for the exact scheme.
 // Routes to EIP-3009 or Permit2 based on requirements.Extra["assetTransferMethod"].
 // Defaults to EIP-3009 for backward compatibility.
-func (c *ExactEvmScheme) CreatePaymentPayload(
-	ctx context.Context,
-	requirements types.PaymentRequirements,
-) (types.PaymentPayload, error) {
-	assetTransferMethod := evm.AssetTransferMethodEIP3009 // default
-	if requirements.Extra != nil {
-		if method, ok := requirements.Extra["assetTransferMethod"].(string); ok {
-			assetTransferMethod = evm.AssetTransferMethod(method)
-		}
-	}
-	if assetTransferMethod == evm.AssetTransferMethodPermit2 {
-		return CreatePermit2Payload(ctx, c.signer, requirements)
-	}
-	return c.createEIP3009Payload(ctx, requirements)
-}
-
-// CreatePaymentPayloadWithExtensions creates a payment payload with extension awareness.
 // For Permit2 flows, if the server advertises eip2612GasSponsoring and the signer
 // supports ReadContract, automatically signs an EIP-2612 permit when Permit2
 // allowance is insufficient.
-func (c *ExactEvmScheme) CreatePaymentPayloadWithExtensions(
+func (c *ExactEvmScheme) CreatePaymentPayload(
 	ctx context.Context,
 	requirements types.PaymentRequirements,
-	extensions map[string]interface{},
+	payloadCtx x402.PaymentPayloadContext,
 ) (types.PaymentPayload, error) {
+	extensions := payloadCtx.Extensions
 	assetTransferMethod := evm.AssetTransferMethodEIP3009
 	if requirements.Extra != nil {
 		if method, ok := requirements.Extra["assetTransferMethod"].(string); ok {
@@ -133,6 +120,12 @@ func (c *ExactEvmScheme) trySignEip2612Permit(
 		return nil, err
 	}
 	if readSigner == nil {
+		c.warnings.WarnMissingCapability(
+			"exact",
+			string(requirements.Network),
+			eip2612gassponsor.EIP2612GasSponsoring.Key(),
+			"the client cannot read contracts; configure ExactEvmSchemeConfig.RPCURL or RPCByChainID, or use an RPC-backed signer such as one created with signers/evm.NewClientSignerFromPrivateKeyWithClient",
+		)
 		return nil, nil
 	}
 
@@ -196,19 +189,6 @@ func (c *ExactEvmScheme) trySignErc20Approval(
 		return nil, nil
 	}
 
-	txSigner, err := c.resolveTxSigner(ctx, requirements.Network)
-	if err != nil {
-		return nil, err
-	}
-	if txSigner == nil {
-		return nil, nil
-	}
-
-	chainID, err := evm.GetEvmChainId(string(requirements.Network))
-	if err != nil {
-		return nil, err
-	}
-
 	tokenAddress := evm.NormalizeAddress(requirements.Asset)
 
 	// If read capability exists, skip signing when Permit2 allowance is already sufficient.
@@ -229,6 +209,25 @@ func (c *ExactEvmScheme) trySignErc20Approval(
 				}
 			}
 		}
+	}
+
+	txSigner, err := c.resolveTxSigner(ctx, requirements.Network)
+	if err != nil {
+		return nil, err
+	}
+	if txSigner == nil {
+		c.warnings.WarnMissingCapability(
+			"exact",
+			string(requirements.Network),
+			erc20approvalgassponsor.ERC20ApprovalGasSponsoring.Key(),
+			"the client cannot sign an ERC-20 approval transaction; configure ExactEvmSchemeConfig.RPCURL or RPCByChainID for RPC access and provide transaction-signing support, or use an RPC-backed signer such as one created with signers/evm.NewClientSignerFromPrivateKeyWithClient",
+		)
+		return nil, nil
+	}
+
+	chainID, err := evm.GetEvmChainId(string(requirements.Network))
+	if err != nil {
+		return nil, err
 	}
 
 	// Sign the approve transaction
@@ -276,7 +275,8 @@ func (c *ExactEvmScheme) createEIP3009Payload(
 	}
 
 	// V2 specific: No buffer on validAfter (can use immediately)
-	validAfter, validBefore := evm.CreateValidityWindow(time.Hour)
+	timeoutDuration := time.Duration(requirements.MaxTimeoutSeconds) * time.Second
+	validAfter, validBefore := evm.CreateValidityWindow(timeoutDuration)
 
 	// Extract extra fields for EIP-3009
 	tokenName := assetInfo.Name

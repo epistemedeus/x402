@@ -14,8 +14,8 @@ import {
   BUILDER_CODE_PATTERN,
   MAX_CLIENT_SERVICE_CODES,
   MAX_SERVER_SERVICE_CODES,
-  type BuilderCodeExtensionData,
   type BuilderCodeFacilitatorConfig,
+  type BuilderCodeSuffixData,
   type DataSuffixContext,
 } from "./types";
 
@@ -98,20 +98,26 @@ export class BuilderCodeFacilitatorExtension implements FacilitatorExtension {
   /**
    * Builds the ERC-8021 Schema 2 calldata suffix for a settlement transaction.
    *
-   * - `a` and `s` are read from the client's payment payload extensions.
+   * - On v2 payloads, `a` is read from the client's payment payload extensions.
+   * - On v1 payloads, client `a` is omitted (no resource-server echo gate); `s` is still read.
    * - `w` is the facilitator's own code when configured.
    * - The facilitator's own `s` entry (`config.serviceCode`) is appended after the
    *   echoed client/server codes, within its own {@link MAX_FACILITATOR_SERVICE_CODES}
    *   reservation.
    *
-   * @param ctx - Settlement context with payment-payload extensions
-   * @returns Hex-encoded ERC-8021 builder-code calldata suffix, or undefined when no attribution is present
+   * - `m` is the settlement metadata supplied by the settling mechanism in `ctx.metadata`.
+   *   It is never read from the client payload.
+   *
+   * @param ctx - Settlement context with payment-payload extensions and optional metadata
+   * @returns Hex-encoded ERC-8021 builder-code calldata suffix, or undefined when no attribution or metadata is present
    */
   buildDataSuffix(ctx: DataSuffixContext): Hex | undefined {
     const clientExt = extractClientExtension(ctx.paymentPayload.extensions);
-
+    // v1 payloads omit `a`: the resource-server echo gate does not run on v1.
     const a =
-      typeof clientExt?.a === "string" && BUILDER_CODE_PATTERN.test(clientExt.a)
+      ctx.paymentPayload.x402Version === 2 &&
+      typeof clientExt?.a === "string" &&
+      BUILDER_CODE_PATTERN.test(clientExt.a)
         ? clientExt.a
         : undefined;
     const echoedServiceCodes = resolveServiceCodes(clientExt?.s);
@@ -120,13 +126,20 @@ export class BuilderCodeFacilitatorExtension implements FacilitatorExtension {
         ? [...echoedServiceCodes, this.config.serviceCode]
         : echoedServiceCodes;
 
-    const data: BuilderCodeExtensionData = {
+    const hasMetadata = ctx.metadata !== undefined && Object.keys(ctx.metadata).length > 0;
+    const data: BuilderCodeSuffixData = {
       ...(this.config.builderCode && { w: this.config.builderCode }),
       ...(a && { a }),
       ...(s.length > 0 && { s }),
+      ...(hasMetadata && { m: ctx.metadata }),
     };
 
-    if (!data.a && !data.w && (!data.s || (Array.isArray(data.s) && data.s.length === 0))) {
+    if (
+      !data.a &&
+      !data.w &&
+      !data.m &&
+      (!data.s || (Array.isArray(data.s) && data.s.length === 0))
+    ) {
       return undefined;
     }
 

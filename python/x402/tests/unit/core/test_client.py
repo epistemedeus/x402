@@ -1,5 +1,8 @@
 """Unit tests for x402Client and x402ClientSync - manual registration and policies."""
 
+import asyncio
+import threading
+
 import pytest
 
 from x402 import (
@@ -10,12 +13,17 @@ from x402 import (
     x402ClientSync,
 )
 from x402.schemas import (
+    NoMatchingRequirementsError,
     PaymentPayload,
     PaymentRequired,
     PaymentRequirements,
     SettleResponse,
 )
-from x402.schemas.hooks import PaymentResponseContext, RecoveredResponseResult
+from x402.schemas.hooks import (
+    PaymentResponseContext,
+    RecoveredPayloadResult,
+    RecoveredResponseResult,
+)
 from x402.schemas.v1 import PaymentRequiredV1, PaymentRequirementsV1
 
 # =============================================================================
@@ -31,6 +39,7 @@ class MockSchemeClient:
     def __init__(self, scheme: str = "mock"):
         self.scheme = scheme
         self.create_calls: list = []
+        self.create_contexts: list = []
         # Treat any asset as a recognized default so non-spend-control tests pass
         # the default allowlist (USD cap still applies unless overridden).
         self.find_default_asset = lambda asset, _network=None: {
@@ -39,8 +48,9 @@ class MockSchemeClient:
             "symbol": "MOCK",
         }
 
-    def create_payment_payload(self, requirements):
+    def create_payment_payload(self, requirements, context=None):
         self.create_calls.append(requirements)
+        self.create_contexts.append(context)
         return {"mock": "payload", "network": requirements.network}
 
     def set_find_default_asset(self, lookup):
@@ -372,6 +382,148 @@ class TestPaymentCreationFailureHooks:
             client.create_payment_payload(payment_required)
 
         assert failure_errors == [after_error]
+
+
+class _LoopGatedSchemeClient(MockSchemeClient):
+    """Scheme whose payload creation blocks until the event loop releases it.
+
+    Stands in for a scheme doing synchronous network I/O: it can only finish
+    if the event loop keeps running while ``create_payment_payload`` blocks.
+    """
+
+    def __init__(self, scheme: str = "exact"):
+        super().__init__(scheme)
+        self.release = threading.Event()
+        self.released_in_time: bool | None = None
+        self.thread_id: int | None = None
+
+    def create_payment_payload(self, requirements, context=None):
+        self.thread_id = threading.get_ident()
+        self.released_in_time = self.release.wait(timeout=5)
+        return super().create_payment_payload(requirements, context)
+
+
+class _LoopGatedSchemeClientV1(MockSchemeClientV1):
+    def __init__(self, scheme: str = "exact"):
+        super().__init__(scheme)
+        self.release = threading.Event()
+        self.released_in_time: bool | None = None
+
+    def create_payment_payload(self, requirements):
+        self.released_in_time = self.release.wait(timeout=5)
+        return super().create_payment_payload(requirements)
+
+
+class TestSchemePayloadCreationOffLoop:
+    """The async client must not run blocking scheme code on the event loop."""
+
+    @pytest.mark.asyncio
+    async def test_async_client_keeps_event_loop_running_during_scheme_call(self):
+        scheme = _LoopGatedSchemeClient()
+        client = x402Client().register("eip155:8453", scheme)
+        payment_required = PaymentRequired(
+            x402_version=2,
+            accepts=[_make_payment_requirements()],
+        )
+
+        async def release_from_loop():
+            # Only runs if the loop is free while the scheme is blocked.
+            while scheme.thread_id is None:
+                await asyncio.sleep(0)
+            scheme.release.set()
+
+        releaser = asyncio.create_task(release_from_loop())
+        payload = await client.create_payment_payload(payment_required)
+        await releaser
+
+        assert scheme.released_in_time is True
+        assert scheme.thread_id != threading.get_ident()
+        assert payload.payload == {"mock": "payload", "network": "eip155:8453"}
+
+    @pytest.mark.asyncio
+    async def test_async_client_keeps_event_loop_running_during_v1_scheme_call(self):
+        scheme = _LoopGatedSchemeClientV1()
+        client = x402Client().register_v1("base-sepolia", scheme)
+        payment_required = PaymentRequiredV1(
+            x402_version=1,
+            accepts=[
+                PaymentRequirementsV1(
+                    scheme="exact",
+                    network="base-sepolia",
+                    max_amount_required="1000",
+                    resource="https://example.com/paid",
+                    pay_to="0x1234567890123456789012345678901234567890",
+                    max_timeout_seconds=300,
+                    asset="0x0000000000000000000000000000000000000000",
+                )
+            ],
+        )
+
+        async def release_from_loop():
+            await asyncio.sleep(0.01)
+            scheme.release.set()
+
+        releaser = asyncio.create_task(release_from_loop())
+        payload = await client.create_payment_payload(payment_required)
+        await releaser
+
+        assert scheme.released_in_time is True
+        assert payload.payload == {"mock": "v1-payload", "network": "base-sepolia"}
+
+    def test_sync_client_runs_scheme_on_calling_thread(self):
+        scheme = _LoopGatedSchemeClient()
+        scheme.release.set()
+        client = x402ClientSync().register("eip155:8453", scheme)
+        payment_required = PaymentRequired(
+            x402_version=2,
+            accepts=[_make_payment_requirements()],
+        )
+
+        client.create_payment_payload(payment_required)
+
+        assert scheme.thread_id == threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_scheme_error_still_reaches_failure_hook(self):
+        scheme_error = RuntimeError("rpc unavailable")
+
+        class FailingScheme(MockSchemeClient):
+            def create_payment_payload(self, requirements, context=None):
+                raise scheme_error
+
+        client = x402Client().register("eip155:8453", FailingScheme("exact"))
+        payment_required = PaymentRequired(
+            x402_version=2,
+            accepts=[_make_payment_requirements()],
+        )
+        failure_errors: list[Exception] = []
+        recovered = _make_payment_payload()
+
+        async def failure_hook(ctx):
+            failure_errors.append(ctx.error)
+            return RecoveredPayloadResult(payload=recovered)
+
+        client.on_payment_creation_failure(failure_hook)
+
+        payload = await client.create_payment_payload(payment_required)
+
+        assert failure_errors == [scheme_error]
+        assert payload is recovered
+
+    @pytest.mark.asyncio
+    async def test_scheme_error_propagates_without_recovery(self):
+        class FailingScheme(MockSchemeClient):
+            def create_payment_payload(self, requirements, context=None):
+                raise ValueError("feePayer is required")
+
+        client = x402Client().register("eip155:8453", FailingScheme("exact"))
+        payment_required = PaymentRequired(
+            x402_version=2,
+            accepts=[_make_payment_requirements()],
+        )
+
+        with pytest.raises(ValueError, match="feePayer is required"):
+            await client.create_payment_payload(payment_required)
 
 
 class TestOnPaymentResponseRegistration:
@@ -1132,3 +1284,136 @@ class TestSpendControls:
             await client.create_payment_payload(
                 self._required(self._req(asset=rlusd["asset"], amount="1.01", network=xrpl))
             )
+
+    @pytest.mark.asyncio
+    async def test_passes_the_resolved_atomic_spend_cap_on_payment_payload_context(self):
+        client, mock_client = self._client_with_default_asset(self.usdc)
+        await client.create_payment_payload(
+            self._required(self._req(asset=self.usdc["asset"], amount="1000"))
+        )
+        assert mock_client.create_contexts[0].max_amount_per_payment == "1000000"
+
+    @pytest.mark.asyncio
+    async def test_omits_the_spend_cap_on_context_when_spend_controls_are_disabled(self):
+        client, mock_client = self._client_with_default_asset(self.usdc, False)
+        await client.create_payment_payload(
+            self._required(self._req(asset=self.usdc["asset"], amount="5000000"))
+        )
+        assert mock_client.create_contexts[0].max_amount_per_payment is None
+
+    @pytest.mark.asyncio
+    async def test_omits_the_spend_cap_on_context_when_the_usd_cap_is_disabled(self):
+        client, mock_client = self._client_with_default_asset(
+            self.usdc, {"max_amount_per_payment": False}
+        )
+        await client.create_payment_payload(
+            self._required(self._req(asset=self.usdc["asset"], amount="5000000"))
+        )
+        assert mock_client.create_contexts[0].max_amount_per_payment is None
+
+    @pytest.mark.asyncio
+    async def test_passes_a_custom_money_usd_cap_on_context_in_atomic_units(self):
+        client, mock_client = self._client_with_default_asset(
+            self.usdc, {"max_amount_per_payment": "$5"}
+        )
+        await client.create_payment_payload(
+            self._required(self._req(asset=self.usdc["asset"], amount="1000"))
+        )
+        assert mock_client.create_contexts[0].max_amount_per_payment == "5000000"
+
+    @pytest.mark.asyncio
+    async def test_passes_an_allowed_assets_atomic_cap_on_context(self):
+        client, mock_client = self._client_with_default_asset(
+            self.usdc,
+            {
+                "allowed_assets": [
+                    {
+                        "asset": self.usdc["asset"],
+                        "network": self.network,
+                        "max_amount_per_payment": "500000",
+                    }
+                ]
+            },
+        )
+        await client.create_payment_payload(
+            self._required(self._req(asset=self.usdc["asset"], amount="100"))
+        )
+        assert mock_client.create_contexts[0].max_amount_per_payment == "500000"
+
+
+class TestPaymentFlowSelection:
+    """Client selection drops unrecognized paymentFlow and prefers authorization."""
+
+    network = "eip155:8453"
+
+    def _req(self, *, amount: str = "100", extra: dict | None = None):
+        return PaymentRequirements(
+            scheme="exact",
+            network=self.network,
+            asset="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            amount=amount,
+            pay_to="0xpay",
+            max_timeout_seconds=60,
+            extra=extra or {},
+        )
+
+    def _required(self, *accepts):
+        return PaymentRequired(x402_version=2, accepts=list(accepts))
+
+    def _client(self):
+        mock_client = MockSchemeClient("exact")
+        client = x402Client().register(self.network, mock_client)
+        return client, mock_client
+
+    @pytest.mark.asyncio
+    async def test_drops_accepts_with_unrecognized_payment_flow(self):
+        client, mock_client = self._client()
+        known = self._req(amount="100")
+        unknown = self._req(amount="200", extra={"paymentFlow": "future-flow"})
+        await client.create_payment_payload(self._required(unknown, known))
+        assert mock_client.create_calls[0] == known
+
+    @pytest.mark.asyncio
+    async def test_throws_when_every_accept_has_unrecognized_payment_flow(self):
+        client, _ = self._client()
+        with pytest.raises(
+            NoMatchingRequirementsError,
+            match="No payment requirements with a recognized paymentFlow",
+        ):
+            await client.create_payment_payload(
+                self._required(self._req(extra={"paymentFlow": "future-flow"}))
+            )
+
+    @pytest.mark.asyncio
+    async def test_prefers_authorization_over_upfront(self):
+        client, mock_client = self._client()
+        upfront = self._req(amount="100", extra={"paymentFlow": "upfront"})
+        auth = self._req(amount="200")
+        await client.create_payment_payload(self._required(upfront, auth))
+        assert mock_client.create_calls[0] == auth
+
+    @pytest.mark.asyncio
+    async def test_prefers_explicit_authorization_over_escrow(self):
+        client, mock_client = self._client()
+        escrow = self._req(amount="100", extra={"paymentFlow": "escrow"})
+        auth = self._req(amount="200", extra={"paymentFlow": "authorization"})
+        await client.create_payment_payload(self._required(escrow, auth))
+        assert mock_client.create_calls[0] == auth
+
+    @pytest.mark.asyncio
+    async def test_selects_upfront_when_it_is_the_only_remaining_accept(self):
+        client, mock_client = self._client()
+        upfront = self._req(amount="100", extra={"paymentFlow": "upfront"})
+        await client.create_payment_payload(self._required(upfront))
+        assert mock_client.create_calls[0] == upfront
+
+    @pytest.mark.asyncio
+    async def test_custom_policies_override_authorization_preference(self):
+        client, mock_client = self._client()
+        upfront = self._req(amount="100", extra={"paymentFlow": "upfront"})
+        auth = self._req(amount="200")
+        client.register_policy(
+            lambda _version, reqs: [r for r in reqs if r.extra.get("paymentFlow") == "upfront"]
+        )
+        await client.create_payment_payload(self._required(auth, upfront))
+        assert mock_client.create_calls[0] == upfront

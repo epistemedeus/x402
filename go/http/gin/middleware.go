@@ -13,7 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 	x402 "github.com/x402-foundation/x402/go/v2"
 	"github.com/x402-foundation/x402/go/v2/extensions/bazaar"
-	extypes "github.com/x402-foundation/x402/go/v2/extensions/types"
 	x402http "github.com/x402-foundation/x402/go/v2/http"
 )
 
@@ -194,11 +193,11 @@ func PaymentMiddleware(routes x402http.RoutesConfig, server *x402.X402ResourceSe
 		ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
 		defer cancel()
 		if err := httpServer.Initialize(ctx); err != nil {
-			fmt.Printf("Warning: failed to initialize x402 server: %v\n", err)
+			x402http.HandleBackgroundInitError(err)
 		}
 	}
 
-	validateBazaarExtensions(routes)
+	bazaar.ValidateBazaarRouteExtensions(routes)
 
 	// Create middleware handler using shared logic
 	return createMiddlewareHandler(httpServer, config)
@@ -235,11 +234,11 @@ func PaymentMiddlewareFromHTTPServer(httpServer *x402http.HTTPServer, opts ...Mi
 		ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
 		defer cancel()
 		if err := httpServer.Initialize(ctx); err != nil {
-			fmt.Printf("Warning: failed to initialize x402 server: %v\n", err)
+			x402http.HandleBackgroundInitError(err)
 		}
 	}
 
-	validateBazaarExtensionsFromServer(httpServer)
+	bazaar.ValidateBazaarRouteExtensionsFromServer(httpServer)
 
 	// Create middleware handler using shared logic
 	return createMiddlewareHandler(httpServer, config)
@@ -280,62 +279,14 @@ func PaymentMiddlewareFromConfig(routes x402http.RoutesConfig, opts ...Middlewar
 		ctx, cancel := context.WithTimeout(context.Background(), config.Timeout)
 		defer cancel()
 		if err := httpServer.Initialize(ctx); err != nil {
-			fmt.Printf("Warning: failed to initialize x402 server: %v\n", err)
+			x402http.HandleBackgroundInitError(err)
 		}
 	}
 
-	validateBazaarExtensions(config.Routes)
+	bazaar.ValidateBazaarRouteExtensions(config.Routes)
 
 	// Create middleware handler
 	return createMiddlewareHandler(httpServer, config)
-}
-
-// validateBazaarExtensions validates all bazaar extensions declared on routes using
-// the bazaar package's JSON-schema validator. Emits warnings but does not block startup.
-func validateBazaarExtensions(routes x402http.RoutesConfig) {
-	for pattern, config := range routes {
-		validateSingleBazaarExtension(pattern, config.Extensions)
-	}
-}
-
-// validateBazaarExtensionsFromServer validates bazaar extensions from pre-compiled routes.
-func validateBazaarExtensionsFromServer(server *x402http.HTTPServer) {
-	for _, route := range server.GetCompiledRoutes() {
-		pattern := route.Verb + " " + route.Regex.String()
-		validateSingleBazaarExtension(pattern, route.Config.Extensions)
-	}
-}
-
-func validateSingleBazaarExtension(pattern string, extensions map[string]interface{}) {
-	extVal, ok := extensions[extypes.BAZAAR.Key()]
-	if !ok || extVal == nil {
-		return
-	}
-	extMap, isMap := extVal.(map[string]interface{})
-	if !isMap || extMap["info"] == nil || extMap["schema"] == nil {
-		fmt.Printf("x402 Warning: Route %q declares a bazaar extension but it is malformed "+
-			"(expected an object with \"info\" and \"schema\" fields)\n", pattern)
-		return
-	}
-	extJSON, err := json.Marshal(extVal)
-	if err != nil {
-		return
-	}
-	var ext extypes.DiscoveryExtension
-	if err := json.Unmarshal(extJSON, &ext); err != nil {
-		return
-	}
-	specResult := bazaar.ValidateDiscoveryExtensionSpec(ext)
-	if !specResult.Valid {
-		fmt.Printf("x402 Warning: Route %q has invalid bazaar extension: %s\n",
-			pattern, strings.Join(specResult.Errors, ", "))
-		return
-	}
-	result := bazaar.ValidateDiscoveryExtension(ext)
-	if !result.Valid {
-		fmt.Printf("x402 Warning: Route %q has invalid bazaar extension: %s\n",
-			pattern, strings.Join(result.Errors, ", "))
-	}
 }
 
 // createMiddlewareHandler creates the actual Gin handler function.
@@ -345,11 +296,11 @@ func createMiddlewareHandler(server *x402http.HTTPServer, config *MiddlewareConf
 		adapter := NewGinAdapter(c)
 		reqCtx := x402http.HTTPRequestContext{
 			Adapter: adapter,
-			// EscapedPath, not Path: routers dispatch on the escaped path, so
-			// matching on the decoded one lets "%2F" split a segment here but
-			// not in the router, bypassing the payment gate.
-			Path:   c.Request.URL.EscapedPath(),
-			Method: c.Request.Method,
+			// Match both EscapedPath and URL.Path (the decoded routing view)
+			// so a route can't be bypassed via either representation.
+			Path:        c.Request.URL.EscapedPath(),
+			DecodedPath: c.Request.URL.Path,
+			Method:      c.Request.Method,
 		}
 
 		// Check if route requires payment before waiting for initialization
@@ -392,8 +343,16 @@ func handlePaymentError(c *gin.Context, response *x402http.HTTPResponseInstructi
 	}
 
 	// Send response body
+	contentType := response.Headers["Content-Type"]
+	if contentType == "" {
+		contentType = response.Headers["content-type"]
+	}
+	mediaType, _, _ := strings.Cut(contentType, ";")
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
 	if response.IsHTML {
 		c.Data(response.Status, "text/html; charset=utf-8", []byte(response.Body.(string)))
+	} else if text, ok := response.Body.(string); ok && mediaType == "text/plain" {
+		c.Data(response.Status, contentType, []byte(text))
 	} else {
 		c.JSON(response.Status, response.Body)
 	}
@@ -554,7 +513,7 @@ func handlePaymentVerified(c *gin.Context, server *x402http.HTTPServer, ctx cont
 			handlePaymentError(c, settleResult.Response, config)
 		default:
 			// Fallback if Response is nil
-			c.JSON(http.StatusPaymentRequired, map[string]interface{}{})
+			c.JSON(http.StatusPaymentRequired, map[string]string{"error": x402.ErrCodeSettlementFailed})
 		}
 		return
 	}

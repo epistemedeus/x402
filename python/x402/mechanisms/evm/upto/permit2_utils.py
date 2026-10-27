@@ -16,15 +16,16 @@ except ImportError as e:
     ) from e
 
 from ....interfaces import FacilitatorContext  # noqa: E402
+from ....pending_settlement_store import PendingSettlementStore  # noqa: E402
 from ....schemas import (  # noqa: E402
     PaymentPayload,
     PaymentRequirements,
     SettleResponse,
     VerifyResponse,
 )
+from ..asset_cache import start_asset_contract_check  # noqa: E402
 from ..constants import (  # noqa: E402
     BALANCE_OF_ABI,
-    ERR_ASSET_NOT_DEPLOYED_CONTRACT,
     ERR_ERC20_APPROVAL_BROADCAST_FAILED,
     ERR_ERC20_APPROVAL_TX_FAILED,
     ERR_PERMIT2_AMOUNT_MISMATCH,
@@ -55,9 +56,10 @@ from ..constants import (  # noqa: E402
 from ..data_suffix import resolve_data_suffix  # noqa: E402
 from ..erc6492 import parse_erc6492_signature  # noqa: E402
 
-# Reuse exact's allowance verification and settle error mapping
+# Reuse exact's allowance verification, pending-settlement reconciliation, and settle error mapping
 from ..exact.permit2_utils import (  # noqa: E402
     _verify_permit2_allowance,
+    reconcile_pending_permit2,
 )
 from ..settle_receipt import wait_for_receipt_and_build_response  # noqa: E402
 from ..signer import FacilitatorEvmSigner  # noqa: E402
@@ -118,11 +120,9 @@ def verify_upto_permit2(
         )
     token_address = normalize_address(requirements.asset)
 
-    code = signer.get_code(token_address)
-    if len(code) == 0:
-        return VerifyResponse(
-            is_valid=False, invalid_reason=ERR_ASSET_NOT_DEPLOYED_CONTRACT, payer=payer
-        )
+    # Start after network/asset are known; await after signature work so a failed
+    # pre-check does not RPC or populate the positive cache.
+    asset_check = start_asset_contract_check(signer, str(requirements.network), requirements.asset)
 
     # 3. Spender check
     try:
@@ -240,6 +240,10 @@ def verify_upto_permit2(
         return VerifyResponse(
             is_valid=False, invalid_reason=ERR_PERMIT2_INVALID_SIGNATURE, payer=payer
         )
+
+    asset_reason = asset_check.await_result()
+    if asset_reason:
+        return VerifyResponse(is_valid=False, invalid_reason=asset_reason, payer=payer)
 
     # If simulation is disabled, skip allowance/balance/simulation checks (matches Go/TS).
     if not simulate:
@@ -477,11 +481,16 @@ def settle_upto_permit2(
     requirements: PaymentRequirements,
     context: FacilitatorContext | None = None,
     simulate_in_settle: bool = False,
+    pending_store: PendingSettlementStore | None = None,
 ) -> SettleResponse:
     """Settle an upto Permit2 payment on-chain.
 
     The settlement amount comes from requirements.amount (set by the resource server).
     It must be <= the authorized maximum (permit2_authorization.permitted.amount).
+
+    pending_store: Optional store letting a retried settle for the same payload reconcile
+        against an already-broadcast transaction instead of re-verifying and
+        re-broadcasting (see settlement_pending).
     """
     from ....extensions.eip2612_gas_sponsoring import extract_eip2612_gas_sponsoring_info
     from ....extensions.erc20_approval_gas_sponsoring import (
@@ -503,6 +512,24 @@ def settle_upto_permit2(
             payer=payer,
             transaction="",
         )
+
+    # Fast path: a prior settle attempt for this exact payload already broadcast a
+    # transaction whose receipt wait failed (settlement_pending). Reconcile against it
+    # instead of re-verifying/re-broadcasting. The resource server's retry resends the
+    # identical requirements, so settlement_amount above still matches the original attempt.
+    reconciled = reconcile_pending_permit2(
+        signer,
+        payload,
+        context,
+        pending_store,
+        permit2_payload.signature,
+        network,
+        payer,
+        ERR_UPTO_TRANSACTION_FAILED,
+        amount=str(settlement_amount),
+    )
+    if reconciled is not None:
+        return reconciled
 
     # Re-verify with permitted.amount (the authorized max), not the settlement amount
     verify_requirements = PaymentRequirements(
@@ -565,6 +592,7 @@ def settle_upto_permit2(
             eip2612_info,
             settlement_amount,
             data_suffix=data_suffix,
+            pending_store=pending_store,
         )
 
     # Branch: ERC-20 approval gas sponsoring
@@ -581,11 +609,17 @@ def settle_upto_permit2(
                     erc20_info,
                     settlement_amount,
                     data_suffix=data_suffix,
+                    pending_store=pending_store,
                 )
 
     # Branch: standard settle
     return _settle_upto_direct(
-        signer, payload, permit2_payload, settlement_amount, data_suffix=data_suffix
+        signer,
+        payload,
+        permit2_payload,
+        settlement_amount,
+        data_suffix=data_suffix,
+        pending_store=pending_store,
     )
 
 
@@ -623,6 +657,7 @@ def _settle_upto_direct(
     permit2_payload: UptoPermit2Payload,
     settlement_amount: int,
     data_suffix: str | None = None,
+    pending_store: PendingSettlementStore | None = None,
 ) -> SettleResponse:
     """Standard upto Permit2 settle — allowance is already on-chain."""
     payer = permit2_payload.permit2_authorization.from_address
@@ -652,6 +687,8 @@ def _settle_upto_direct(
             payer,
             failed_reason=ERR_UPTO_TRANSACTION_FAILED,
             amount=str(settlement_amount),
+            pending_store=pending_store,
+            pending_key=permit2_payload.signature,
         )
 
     except Exception as e:
@@ -665,6 +702,7 @@ def _settle_upto_with_eip2612(
     eip2612_info: Any,
     settlement_amount: int,
     data_suffix: str | None = None,
+    pending_store: PendingSettlementStore | None = None,
 ) -> SettleResponse:
     """Settle via settleWithPermit — includes the EIP-2612 permit atomically."""
     payer = permit2_payload.permit2_authorization.from_address
@@ -713,6 +751,8 @@ def _settle_upto_with_eip2612(
             payer,
             failed_reason=ERR_UPTO_TRANSACTION_FAILED,
             amount=str(settlement_amount),
+            pending_store=pending_store,
+            pending_key=permit2_payload.signature,
         )
 
     except Exception as e:
@@ -726,6 +766,7 @@ def _settle_upto_with_erc20_approval(
     erc20_info: Any,
     settlement_amount: int,
     data_suffix: str | None = None,
+    pending_store: PendingSettlementStore | None = None,
 ) -> SettleResponse:
     """Settle via extension signer's send_transactions (approval + settle)."""
     payer = permit2_payload.permit2_authorization.from_address
@@ -764,6 +805,8 @@ def _settle_upto_with_erc20_approval(
             payer,
             failed_reason=ERR_UPTO_TRANSACTION_FAILED,
             amount=str(settlement_amount),
+            pending_store=pending_store,
+            pending_key=permit2_payload.signature,
         )
 
     except Exception as e:

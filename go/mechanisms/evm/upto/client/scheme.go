@@ -13,20 +13,23 @@ import (
 	"github.com/x402-foundation/x402/go/v2/extensions/erc20approvalgassponsor"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/evm"
 	exactclient "github.com/x402-foundation/x402/go/v2/mechanisms/evm/exact/client"
+	"github.com/x402-foundation/x402/go/v2/mechanisms/evm/internal/clientutil"
 	"github.com/x402-foundation/x402/go/v2/types"
 )
 
-// UptoEvmScheme implements SchemeNetworkClient and ExtensionAwareClient for EVM upto payments.
+// UptoEvmScheme implements SchemeNetworkClient for EVM upto payments.
 // Always uses Permit2 (no EIP-3009 path).
 type UptoEvmScheme struct {
-	signer evm.ClientEvmSigner
-	config *UptoEvmSchemeConfig
+	signer   evm.ClientEvmSigner
+	config   *UptoEvmSchemeConfig
+	warnings *clientutil.WarningSet
 }
 
 func NewUptoEvmScheme(signer evm.ClientEvmSigner, config *UptoEvmSchemeConfig) *UptoEvmScheme {
 	return &UptoEvmScheme{
-		signer: signer,
-		config: config,
+		signer:   signer,
+		config:   config,
+		warnings: &clientutil.WarningSet{},
 	}
 }
 
@@ -43,19 +46,14 @@ func (c *UptoEvmScheme) FindDefaultAsset(asset string, network x402.Network) *x4
 }
 
 // CreatePaymentPayload creates a V2 payment payload for the upto scheme (always Permit2).
+// If the server advertises eip2612GasSponsoring and the signer supports ReadContract,
+// automatically signs an EIP-2612 permit when Permit2 allowance is insufficient.
 func (c *UptoEvmScheme) CreatePaymentPayload(
 	ctx context.Context,
 	requirements types.PaymentRequirements,
+	payloadCtx x402.PaymentPayloadContext,
 ) (types.PaymentPayload, error) {
-	return CreateUptoPermit2Payload(ctx, c.signer, requirements)
-}
-
-// CreatePaymentPayloadWithExtensions creates a payment payload with extension support.
-func (c *UptoEvmScheme) CreatePaymentPayloadWithExtensions(
-	ctx context.Context,
-	requirements types.PaymentRequirements,
-	extensions map[string]interface{},
-) (types.PaymentPayload, error) {
+	extensions := payloadCtx.Extensions
 	result, err := CreateUptoPermit2Payload(ctx, c.signer, requirements)
 	if err != nil {
 		return types.PaymentPayload{}, err
@@ -105,6 +103,12 @@ func (c *UptoEvmScheme) trySignEip2612Permit(
 		return nil, err
 	}
 	if readSigner == nil {
+		c.warnings.WarnMissingCapability(
+			"upto",
+			string(requirements.Network),
+			eip2612gassponsor.EIP2612GasSponsoring.Key(),
+			"the client cannot read contracts; configure UptoEvmSchemeConfig.RPCURL or RPCByChainID, or use an RPC-backed signer such as one created with signers/evm.NewClientSignerFromPrivateKeyWithClient",
+		)
 		return nil, nil
 	}
 
@@ -161,19 +165,6 @@ func (c *UptoEvmScheme) trySignErc20Approval(
 		return nil, nil
 	}
 
-	txSigner, err := c.resolveTxSigner(ctx, string(requirements.Network))
-	if err != nil {
-		return nil, err
-	}
-	if txSigner == nil {
-		return nil, nil
-	}
-
-	chainID, err := evm.GetEvmChainId(string(requirements.Network))
-	if err != nil {
-		return nil, err
-	}
-
 	tokenAddress := evm.NormalizeAddress(requirements.Asset)
 
 	if readSigner, hasRead := c.signer.(evm.ClientEvmSignerWithReadContract); hasRead {
@@ -193,6 +184,25 @@ func (c *UptoEvmScheme) trySignErc20Approval(
 				}
 			}
 		}
+	}
+
+	txSigner, err := c.resolveTxSigner(ctx, string(requirements.Network))
+	if err != nil {
+		return nil, err
+	}
+	if txSigner == nil {
+		c.warnings.WarnMissingCapability(
+			"upto",
+			string(requirements.Network),
+			erc20approvalgassponsor.ERC20ApprovalGasSponsoring.Key(),
+			"the client cannot sign an ERC-20 approval transaction; configure UptoEvmSchemeConfig.RPCURL or RPCByChainID for RPC access and provide transaction-signing support, or use an RPC-backed signer such as one created with signers/evm.NewClientSignerFromPrivateKeyWithClient",
+		)
+		return nil, nil
+	}
+
+	chainID, err := evm.GetEvmChainId(string(requirements.Network))
+	if err != nil {
+		return nil, err
 	}
 
 	info, err := exactclient.SignErc20ApprovalTransaction(ctx, txSigner, tokenAddress, chainID)

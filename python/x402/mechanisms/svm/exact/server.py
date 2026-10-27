@@ -29,6 +29,11 @@ class ExactSvmScheme:
     """
 
     scheme = SCHEME_EXACT
+    default_asset_transfer_method = "default"
+    payment_flows = {
+        "default": {"supported": ("authorization", "upfront"), "default": "authorization"},
+    }
+    dynamic_extra_fields = ["recentBlockhash", "lastValidBlockHeight"]
 
     def __init__(self, rpc_url: str | None = None):
         """Create ExactSvmScheme.
@@ -145,6 +150,14 @@ class ExactSvmScheme:
         extra = supported_kind.extra or {}
         if "feePayer" in extra:
             requirements.extra["feePayer"] = extra["feePayer"]
+
+        # Copy the transaction message versions the facilitator advertises so
+        # the client builds one of them (absent means version 0).
+        if "transactionVersions" in extra:
+            versions = extra["transactionVersions"]
+            requirements.extra["transactionVersions"] = (
+                list(versions) if isinstance(versions, list) else versions
+            )
 
         if self._rpc_client:
             try:

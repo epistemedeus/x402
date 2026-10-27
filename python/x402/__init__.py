@@ -69,11 +69,32 @@ from .facilitator import x402Facilitator, x402FacilitatorSync
 
 # Interfaces (for implementing custom schemes)
 from .interfaces import (
+    PaymentFlowConfig,
+    PaymentFlowName,
+    PaymentFlowPhases,
+    PaymentPayloadContext,
+    ResolvedPaymentFlow,
     SchemeNetworkClient,
     SchemeNetworkClientV1,
     SchemeNetworkFacilitator,
     SchemeNetworkFacilitatorV1,
     SchemeNetworkServer,
+)
+from .payment_flow import (
+    PAYMENT_FLOWS,
+    SDK_DEFAULT_ASSET_TRANSFER_METHOD,
+    apply_payment_flow_wire_extra,
+    resolve_failure_path_settlement,
+    resolve_payment_flow,
+    resolve_payment_flow_phases,
+)
+
+# Pending-settlement store (settlement_pending auto-recovery)
+from .pending_settlement_store import (
+    ERR_SETTLEMENT_PENDING,
+    PENDING_SETTLEMENT_TTL_SECONDS,
+    InMemoryPendingSettlementStore,
+    PendingSettlementStore,
 )
 
 # Types (re-export commonly used types)
@@ -82,12 +103,15 @@ from .schemas import (
     X402_VERSION,
     # Hooks
     AbortResult,
+    AfterSettleAbortError,
     AssetAmount,
+    CompletedSettlement,
+    # Errors
+    FacilitatorCapabilityError,
     # Config
     FacilitatorConfig,
     Money,
     Network,
-    # Errors
     NoMatchingRequirementsError,
     PaymentAbortedError,
     PaymentCreatedContext,
@@ -119,6 +143,7 @@ from .schemas import (
     SettleContext,
     SettleError,
     SettleFailureContext,
+    SettlePhase,
     # Responses
     SettleResponse,
     SettleResultContext,
@@ -149,7 +174,7 @@ from .server import (
     x402ResourceServerSync,
 )
 
-__version__ = "2.20.0"
+__version__ = "2.25.0"
 
 __all__ = [
     # Version
@@ -171,6 +196,10 @@ __all__ = [
     # Protocols
     "FacilitatorClient",
     "FacilitatorClientSync",
+    "PendingSettlementStore",
+    "InMemoryPendingSettlementStore",
+    "ERR_SETTLEMENT_PENDING",
+    "PENDING_SETTLEMENT_TTL_SECONDS",
     # Policies
     "default_payment_selector",
     "prefer_network",
@@ -182,6 +211,17 @@ __all__ = [
     "SchemeNetworkServer",
     "SchemeNetworkFacilitator",
     "SchemeNetworkFacilitatorV1",
+    "PaymentPayloadContext",
+    "PaymentFlowName",
+    "PaymentFlowPhases",
+    "PaymentFlowConfig",
+    "ResolvedPaymentFlow",
+    "PAYMENT_FLOWS",
+    "SDK_DEFAULT_ASSET_TRANSFER_METHOD",
+    "resolve_payment_flow",
+    "apply_payment_flow_wire_extra",
+    "resolve_payment_flow_phases",
+    "resolve_failure_path_settlement",
     # Types - Base
     "X402_VERSION",
     "Network",
@@ -223,6 +263,8 @@ __all__ = [
     "SettleContext",
     "SettleResultContext",
     "SettleFailureContext",
+    "SettlePhase",
+    "CompletedSettlement",
     "PaymentCreationContext",
     "PaymentCreatedContext",
     "PaymentCreationFailureContext",
@@ -236,7 +278,9 @@ __all__ = [
     "SettleError",
     "SchemeNotFoundError",
     "NoMatchingRequirementsError",
+    "AfterSettleAbortError",
     "PaymentAbortedError",
+    "FacilitatorCapabilityError",
     # Types - Helpers
     "detect_version",
     "match_payload_to_requirements",

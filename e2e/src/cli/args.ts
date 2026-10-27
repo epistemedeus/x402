@@ -18,6 +18,7 @@ export interface ParsedArgs {
   parallel: boolean;
   concurrency: number;
   endpoints?: string[];
+  batchVoucherStore?: 'self' | 'facilitator';
 }
 
 export function parseArgs(): ParsedArgs {
@@ -40,12 +41,23 @@ export function parseArgs(): ParsedArgs {
   const hasFilterArgs = args.some(arg =>
     arg.startsWith('--transport=') ||
     arg.startsWith('--facilitators=') ||
+    (arg.startsWith('--facilitator=') && !arg.startsWith('--facilitators=')) ||
+    arg === '--include-external-facilitators' ||
+    arg.startsWith('--include-external-facilitators=') ||
+    arg.startsWith('--includeExternalFacilitators=') ||
     arg.startsWith('--servers=') ||
     arg.startsWith('--clients=') ||
     arg.startsWith('--extensions=') ||
     arg.startsWith('--versions=') ||
     arg.startsWith('--families=') ||
     arg.startsWith('--schemes=') ||
+    arg.startsWith('--sdk=') ||
+    arg.startsWith('--sdks=') ||
+    arg.startsWith('--paymentflow=') ||
+    arg.startsWith('--paymentFlow=') ||
+    arg.startsWith('--assetTransferMethod=') ||
+    arg.startsWith('--asset-transfer-method=') ||
+    arg.startsWith('--batchVoucherStore=') ||
     arg.startsWith('--endpoints=')
   );
 
@@ -91,14 +103,41 @@ export function parseArgs(): ParsedArgs {
 
   // Parse filters (comma-separated lists)
   const transports = parseListArg(args, '--transport');
-  const facilitators = parseListArg(args, '--facilitators');
+  const facilitators = parseListArg(args, '--facilitators', '--facilitator');
+  // External facilitator proxies are opt-in (excluded by default).
+  const includeExternalFacilitators =
+    args.includes('--include-external-facilitators') ||
+    args.some(a => a.startsWith('--include-external-facilitators=')) ||
+    args.some(a => a.startsWith('--includeExternalFacilitators='));
   const servers = parseListArg(args, '--servers');
   const clients = parseListArg(args, '--clients');
   const extensions = parseListArg(args, '--extensions');
   const versions = parseListArg(args, '--versions')?.map(v => parseInt(v));
   const families = parseListArg(args, '--families');
   const schemes = parseListArg(args, '--schemes');
+  const sdks = parseListArg(args, '--sdk', '--sdks');
+  const paymentFlows = parseListArg(args, '--paymentflow', '--paymentFlow');
+  const assetTransferMethods = parseListArg(
+    args,
+    '--assetTransferMethod',
+    '--asset-transfer-method',
+  );
   const endpoints = parseListArg(args, '--endpoints');
+  const batchVoucherStoreRaw = args
+    .find(a => a.startsWith('--batchVoucherStore='))
+    ?.split('=')
+    .slice(1)
+    .join('=')
+    ?.trim()
+    .toLowerCase();
+  let batchVoucherStore: 'self' | 'facilitator' | undefined;
+  if (batchVoucherStoreRaw) {
+    if (batchVoucherStoreRaw !== 'self' && batchVoucherStoreRaw !== 'facilitator') {
+      console.error('--batchVoucherStore must be "self" or "facilitator"');
+      process.exit(1);
+    }
+    batchVoucherStore = batchVoucherStoreRaw;
+  }
 
   return {
     mode,
@@ -108,12 +147,16 @@ export function parseArgs(): ParsedArgs {
     filters: {
       transports,
       facilitators,
+      includeExternalFacilitators: includeExternalFacilitators || undefined,
       servers,
       clients,
       extensions,
       versions,
       protocolFamilies: families,
       schemes,
+      sdks,
+      paymentFlows,
+      assetTransferMethods,
       endpoints,
     },
     showHelp: false,
@@ -123,13 +166,14 @@ export function parseArgs(): ParsedArgs {
     parallel,
     concurrency,
     endpoints,
+    batchVoucherStore,
   };
 }
 
-function parseListArg(args: string[], argName: string): string[] | undefined {
-  const arg = args.find(a => a.startsWith(`${argName}=`));
+function parseListArg(args: string[], ...argNames: string[]): string[] | undefined {
+  const arg = args.find(a => argNames.some(name => a.startsWith(`${name}=`)));
   if (!arg) return undefined;
-  const value = arg.split('=')[1];
+  const value = arg.split('=').slice(1).join('=');
   return value.split(',').map(v => v.trim()).filter(v => v.length > 0);
 }
 
@@ -147,13 +191,18 @@ export function printHelp(): void {
   console.log('');
   console.log('Programmatic Mode (for CI/workflows):');
   console.log('  --transport=<list>         Comma-separated transports (e.g., http,mcp)');
-  console.log('  --facilitators=<list>      Comma-separated facilitator names');
+  console.log('  --facilitators=<list>      Comma-separated facilitator names (--facilitator alias)');
+  console.log('  --include-external-facilitators  Opt in to external proxies; excluded by default');
   console.log('  --servers=<list>           Comma-separated server names');
   console.log('  --clients=<list>           Comma-separated client names');
   console.log('  --extensions=<list>        Comma-separated extensions (e.g., bazaar)');
   console.log('  --versions=<list>          Comma-separated version numbers (e.g., 1,2)');
   console.log('  --families=<list>          Comma-separated protocol families (e.g., evm,svm,hedera,tvm)');
-  console.log('  --schemes=<list>           Payment schemes: exact, upto, batch-settlement');
+  console.log('  --schemes=<list>           Payment schemes: exact, upto, batch-settlement, auth-capture');
+  console.log('  --sdk=<list>               SDK languages: ts, go, python (aliases: typescript, py)');
+  console.log('  --paymentflow=<list>       Payment flows: authorization, upfront, escrow');
+  console.log('  --assetTransferMethod=<list>  Asset transfer methods: eip3009, permit2, sequence, ticketSequence');
+  console.log('  --batchVoucherStore=<mode> Custody side: self or facilitator (skips the other batch server role)');
   console.log('  --endpoints=<list>         Comma-separated endpoint paths or regex patterns (auto-anchored)');
   console.log('');
   console.log('Options:');
@@ -178,6 +227,8 @@ export function printHelp(): void {
   console.log("  pnpm test --testnet --endpoints='/protected'              # Exact path match");
   console.log("  pnpm test --testnet --endpoints='/protected-permit2.*'   # Regex: all permit2 routes");
   console.log('  pnpm test --testnet --schemes=exact,batch-settlement     # Only those payment schemes');
+  console.log('  pnpm test --testnet --sdk=ts --paymentflow=upfront       # TypeScript SDK, upfront routes');
+  console.log('  pnpm test --testnet --assetTransferMethod=eip3009        # EIP-3009 transfer method only');
   console.log('  pnpm test --testnet --min --parallel -v                   # Parallel mode');
   console.log('  pnpm test --testnet --min --parallel --concurrency=2 -v   # Limited concurrency');
   console.log('');

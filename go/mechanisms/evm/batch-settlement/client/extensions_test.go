@@ -1,13 +1,21 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
+	"log"
 	"math/big"
+	"strings"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/crypto"
+
+	x402 "github.com/x402-foundation/x402/go/v2"
 	"github.com/x402-foundation/x402/go/v2/extensions/eip2612gassponsor"
 	"github.com/x402-foundation/x402/go/v2/extensions/erc20approvalgassponsor"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/evm"
+	evmsigners "github.com/x402-foundation/x402/go/v2/signers/evm"
 	"github.com/x402-foundation/x402/go/v2/types"
 )
 
@@ -35,6 +43,21 @@ type extReadSigner struct {
 	feesErr      error
 	txCount      uint64
 	txCountErr   error
+}
+
+type extReadOnlySigner struct {
+	*mockSigner
+	allowance *big.Int
+}
+
+func (s *extReadOnlySigner) ReadContract(
+	_ context.Context,
+	_ string,
+	_ []byte,
+	_ string,
+	_ ...interface{},
+) (interface{}, error) {
+	return s.allowance, nil
 }
 
 // ReadContract dispatches based on the function name so we can stub both the
@@ -113,20 +136,165 @@ func bothExtensionsDeclared() map[string]interface{} {
 	}
 }
 
-// TestCreatePaymentPayloadWithExtensions_NoExtensionsDeclared confirms that
+func extCtx(extensions map[string]interface{}) x402.PaymentPayloadContext {
+	return x402.PaymentPayloadContext{Extensions: extensions}
+}
+
+func captureBatchExtensionLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	return &logs
+}
+
+func TestCreatePaymentPayloadWarnsOnceWhenEip2612CapabilityIsMissing(t *testing.T) {
+	logs := captureBatchExtensionLogs(t)
+	scheme := batchedExtSchemeWith(&mockSigner{address: extTestSigner, sig: []byte{0xab}})
+
+	for range 2 {
+		payload, err := scheme.CreatePaymentPayload(
+			context.Background(),
+			extRequirementsPermit2(),
+			extCtx(eip2612OnlyDeclared()),
+		)
+		if err != nil {
+			t.Fatalf("CreatePaymentPayload failed: %v", err)
+		}
+		if payload.Extensions != nil {
+			t.Fatalf("expected no extension without read capability, got %+v", payload.Extensions)
+		}
+	}
+
+	output := logs.String()
+	if count := strings.Count(output, "[x402 batch-settlement] eip2612GasSponsoring"); count != 1 {
+		t.Fatalf("expected one warning, got %d: %q", count, output)
+	}
+	if !strings.Contains(output, "ClientEvmSignerWithReadContract") {
+		t.Fatalf("expected actionable read-capability warning, got %q", output)
+	}
+}
+
+func TestCreatePaymentPayloadWarnsWhenErc20ApprovalCapabilityIsMissing(t *testing.T) {
+	logs := captureBatchExtensionLogs(t)
+	scheme := batchedExtSchemeWith(&mockSigner{address: extTestSigner, sig: []byte{0xab}})
+
+	payload, err := scheme.CreatePaymentPayload(
+		context.Background(),
+		extRequirementsPermit2(),
+		extCtx(map[string]interface{}{
+			erc20approvalgassponsor.ERC20ApprovalGasSponsoring.Key(): map[string]interface{}{},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("CreatePaymentPayload failed: %v", err)
+	}
+	if payload.Extensions != nil {
+		t.Fatalf("expected no extension without transaction-signing capability, got %+v", payload.Extensions)
+	}
+	output := logs.String()
+	if !strings.Contains(output, "[x402 batch-settlement] erc20ApprovalGasSponsoring") ||
+		!strings.Contains(output, "NewClientSignerFromPrivateKeyWithClient") {
+		t.Fatalf("expected actionable transaction-signing warning, got %q", output)
+	}
+}
+
+func TestCreatePaymentPayloadDoesNotWarnWhenErc20ApprovalIsNotNeeded(t *testing.T) {
+	logs := captureBatchExtensionLogs(t)
+	signer := &extReadOnlySigner{
+		mockSigner: &mockSigner{address: extTestSigner, sig: []byte{0xab}},
+		allowance:  new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),
+	}
+	scheme := batchedExtSchemeWith(signer)
+
+	payload, err := scheme.CreatePaymentPayload(
+		context.Background(),
+		extRequirementsPermit2(),
+		extCtx(map[string]interface{}{
+			erc20approvalgassponsor.ERC20ApprovalGasSponsoring.Key(): map[string]interface{}{},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("CreatePaymentPayload failed: %v", err)
+	}
+	if payload.Extensions != nil {
+		t.Fatalf("expected no extension with sufficient allowance, got %+v", payload.Extensions)
+	}
+	if strings.Contains(logs.String(), "erc20ApprovalGasSponsoring") {
+		t.Fatalf("expected no warning when approval is unnecessary, got %q", logs.String())
+	}
+}
+
+func TestCreatePaymentPayloadWarnsForStandardSignerWithoutRPC(t *testing.T) {
+	logs := captureBatchExtensionLogs(t)
+	privateKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	signer, err := evmsigners.NewClientSignerFromPrivateKey(hex.EncodeToString(crypto.FromECDSA(privateKey)))
+	if err != nil {
+		t.Fatalf("NewClientSignerFromPrivateKey failed: %v", err)
+	}
+	scheme := batchedExtSchemeWith(signer)
+
+	payload, err := scheme.CreatePaymentPayload(
+		context.Background(),
+		extRequirementsPermit2(),
+		extCtx(bothExtensionsDeclared()),
+	)
+	if err != nil {
+		t.Fatalf("CreatePaymentPayload failed: %v", err)
+	}
+	if payload.Extensions != nil {
+		t.Fatalf("expected no extension without RPC capabilities, got %+v", payload.Extensions)
+	}
+	output := logs.String()
+	for _, extension := range []string{
+		eip2612gassponsor.EIP2612GasSponsoring.Key(),
+		erc20approvalgassponsor.ERC20ApprovalGasSponsoring.Key(),
+	} {
+		if !strings.Contains(output, "[x402 batch-settlement] "+extension) {
+			t.Fatalf("expected warning for %s, got %q", extension, output)
+		}
+	}
+	if !strings.Contains(output, "NewClientSignerFromPrivateKeyWithClient") {
+		t.Fatalf("expected actionable RPC-backed signer guidance, got %q", output)
+	}
+}
+
+func TestTrySignEip2612DoesNotWarnWithoutDepositAmount(t *testing.T) {
+	logs := captureBatchExtensionLogs(t)
+	scheme := batchedExtSchemeWith(&mockSigner{address: extTestSigner, sig: []byte{0xab}})
+
+	if _, err := scheme.trySignEip2612Permit(
+		context.Background(),
+		extRequirementsPermit2(),
+		types.PaymentPayload{Payload: map[string]interface{}{"type": "deposit"}},
+		eip2612OnlyDeclared(),
+	); err != nil {
+		t.Fatalf("trySignEip2612Permit failed: %v", err)
+	}
+	if strings.Contains(logs.String(), "eip2612GasSponsoring") {
+		t.Fatalf("expected no warning without a deposit amount, got %q", logs.String())
+	}
+}
+
+// TestCreatePaymentPayload_NoExtensionsDeclared confirms that
 // when the server's 402 has no extensions, the path is identical to plain
 // CreatePaymentPayload — no enrichment, no extra RPC.
-func TestCreatePaymentPayloadWithExtensions_NoExtensionsDeclared(t *testing.T) {
+func TestCreatePaymentPayload_NoExtensionsDeclared(t *testing.T) {
+	logs := captureBatchExtensionLogs(t)
 	signer := &extReadSigner{
 		mockSigner: &mockSigner{address: extTestSigner, sig: []byte{0xab}},
 		allowance:  big.NewInt(0),
 	}
 	scheme := batchedExtSchemeWith(signer)
 
-	out, err := scheme.CreatePaymentPayloadWithExtensions(
+	out, err := scheme.CreatePaymentPayload(
 		context.Background(),
 		extRequirementsPermit2(),
-		nil,
+		extCtx(nil),
 	)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -134,12 +302,15 @@ func TestCreatePaymentPayloadWithExtensions_NoExtensionsDeclared(t *testing.T) {
 	if out.Extensions != nil {
 		t.Fatalf("expected no extensions when none advertised, got %+v", out.Extensions)
 	}
+	if strings.Contains(logs.String(), "GasSponsoring") {
+		t.Fatalf("expected no gas-sponsoring warning when none was advertised, got %q", logs.String())
+	}
 }
 
-// TestCreatePaymentPayloadWithExtensions_AllowanceShortCircuit confirms the
+// TestCreatePaymentPayload_AllowanceShortCircuit confirms the
 // EIP-2612 path is skipped when the user has already approved Permit2 for at
 // least the deposit amount.
-func TestCreatePaymentPayloadWithExtensions_AllowanceShortCircuit(t *testing.T) {
+func TestCreatePaymentPayload_AllowanceShortCircuit(t *testing.T) {
 	// Deposit defaults to amount * DefaultDepositMultiplier (5) = 500.
 	// Allowance of 1e18 is way more than enough → no permit signed.
 	signer := &extReadSigner{
@@ -149,10 +320,10 @@ func TestCreatePaymentPayloadWithExtensions_AllowanceShortCircuit(t *testing.T) 
 	}
 	scheme := batchedExtSchemeWith(signer)
 
-	out, err := scheme.CreatePaymentPayloadWithExtensions(
+	out, err := scheme.CreatePaymentPayload(
 		context.Background(),
 		extRequirementsPermit2(),
-		eip2612OnlyDeclared(),
+		extCtx(eip2612OnlyDeclared()),
 	)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -162,11 +333,11 @@ func TestCreatePaymentPayloadWithExtensions_AllowanceShortCircuit(t *testing.T) 
 	}
 }
 
-// TestCreatePaymentPayloadWithExtensions_Eip2612SignedWhenAllowanceZero
+// TestCreatePaymentPayload_Eip2612SignedWhenAllowanceZero
 // exercises the happy path: server advertises EIP-2612, user has zero
 // allowance, signer can sign typed data → extension is attached with the
 // expected DEPOSIT amount (not the per-request requirements.Amount).
-func TestCreatePaymentPayloadWithExtensions_Eip2612SignedWhenAllowanceZero(t *testing.T) {
+func TestCreatePaymentPayload_Eip2612SignedWhenAllowanceZero(t *testing.T) {
 	signer := &extReadSigner{
 		mockSigner:   &mockSigner{address: extTestSigner, sig: make([]byte, 65)},
 		allowance:    big.NewInt(0),
@@ -174,10 +345,10 @@ func TestCreatePaymentPayloadWithExtensions_Eip2612SignedWhenAllowanceZero(t *te
 	}
 	scheme := batchedExtSchemeWith(signer)
 
-	out, err := scheme.CreatePaymentPayloadWithExtensions(
+	out, err := scheme.CreatePaymentPayload(
 		context.Background(),
 		extRequirementsPermit2(),
-		eip2612OnlyDeclared(),
+		extCtx(eip2612OnlyDeclared()),
 	)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -206,10 +377,10 @@ func TestCreatePaymentPayloadWithExtensions_Eip2612SignedWhenAllowanceZero(t *te
 	}
 }
 
-// TestCreatePaymentPayloadWithExtensions_Eip2612TakesPriorityOverErc20 pins
+// TestCreatePaymentPayload_Eip2612TakesPriorityOverErc20 pins
 // priority: when both extensions are advertised, EIP-2612 is tried first; if it
 // succeeds, the ERC-20 approval branch is NOT exercised.
-func TestCreatePaymentPayloadWithExtensions_Eip2612TakesPriorityOverErc20(t *testing.T) {
+func TestCreatePaymentPayload_Eip2612TakesPriorityOverErc20(t *testing.T) {
 	signer := &extReadSigner{
 		mockSigner:   &mockSigner{address: extTestSigner, sig: make([]byte, 65)},
 		allowance:    big.NewInt(0),
@@ -217,10 +388,10 @@ func TestCreatePaymentPayloadWithExtensions_Eip2612TakesPriorityOverErc20(t *tes
 	}
 	scheme := batchedExtSchemeWith(signer)
 
-	out, err := scheme.CreatePaymentPayloadWithExtensions(
+	out, err := scheme.CreatePaymentPayload(
 		context.Background(),
 		extRequirementsPermit2(),
-		bothExtensionsDeclared(),
+		extCtx(bothExtensionsDeclared()),
 	)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -233,12 +404,12 @@ func TestCreatePaymentPayloadWithExtensions_Eip2612TakesPriorityOverErc20(t *tes
 	}
 }
 
-// TestCreatePaymentPayloadWithExtensions_Eip2612SkippedWithoutNameVersion
+// TestCreatePaymentPayload_Eip2612SkippedWithoutNameVersion
 // confirms that without name/version on requirements.Extra, the token's EIP-712
 // domain is unknown and the client silently skips signing instead of erroring.
 // The downstream request will then 402 with permit2_allowance_required (the
 // standard Permit2 path's diagnosis).
-func TestCreatePaymentPayloadWithExtensions_Eip2612SkippedWithoutNameVersion(t *testing.T) {
+func TestCreatePaymentPayload_Eip2612SkippedWithoutNameVersion(t *testing.T) {
 	signer := &extReadSigner{
 		mockSigner: &mockSigner{address: extTestSigner, sig: []byte{0xab}},
 		allowance:  big.NewInt(0),
@@ -249,10 +420,10 @@ func TestCreatePaymentPayloadWithExtensions_Eip2612SkippedWithoutNameVersion(t *
 	delete(reqs.Extra, "name")
 	delete(reqs.Extra, "version")
 
-	out, err := scheme.CreatePaymentPayloadWithExtensions(
+	out, err := scheme.CreatePaymentPayload(
 		context.Background(),
 		reqs,
-		eip2612OnlyDeclared(),
+		extCtx(eip2612OnlyDeclared()),
 	)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -262,12 +433,12 @@ func TestCreatePaymentPayloadWithExtensions_Eip2612SkippedWithoutNameVersion(t *
 	}
 }
 
-// TestCreatePaymentPayloadWithExtensions_Eip2612DeadlineFromPermit2
+// TestCreatePaymentPayload_Eip2612DeadlineFromPermit2
 // verifies the EIP-2612 deadline is taken from the just-signed Permit2
 // authorization (not the fallback `now + maxTimeoutSeconds`). This keeps
 // both signatures on the same expiry window. The mockSigner records the
 // signed message, so we read the deadline from there.
-func TestCreatePaymentPayloadWithExtensions_Eip2612DeadlineFromPermit2(t *testing.T) {
+func TestCreatePaymentPayload_Eip2612DeadlineFromPermit2(t *testing.T) {
 	signer := &extReadSigner{
 		mockSigner:   &mockSigner{address: extTestSigner, sig: make([]byte, 65)},
 		allowance:    big.NewInt(0),
@@ -275,10 +446,10 @@ func TestCreatePaymentPayloadWithExtensions_Eip2612DeadlineFromPermit2(t *testin
 	}
 	scheme := batchedExtSchemeWith(signer)
 
-	out, err := scheme.CreatePaymentPayloadWithExtensions(
+	out, err := scheme.CreatePaymentPayload(
 		context.Background(),
 		extRequirementsPermit2(),
-		eip2612OnlyDeclared(),
+		extCtx(eip2612OnlyDeclared()),
 	)
 	if err != nil {
 		t.Fatalf("err: %v", err)

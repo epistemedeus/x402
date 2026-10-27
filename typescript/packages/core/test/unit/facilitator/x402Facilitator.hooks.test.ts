@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { x402Facilitator } from "../../../src/facilitator/x402Facilitator";
 import {
   PaymentPayload,
@@ -189,6 +189,32 @@ describe("x402Facilitator - Lifecycle Hooks", () => {
   });
 
   describe("onVerifyFailure", () => {
+    it("runs afterVerify when verification returns isValid false", async () => {
+      const facilitator = new x402Facilitator();
+      facilitator.register(
+        "eip155:8453",
+        new MockSchemeFacilitator(async () => ({
+          isValid: false,
+          invalidReason: "mismatch",
+        })),
+      );
+
+      const onVerifyFailure = vi.fn();
+      let sawInvalidResult = false;
+      facilitator.onAfterVerify(async context => {
+        sawInvalidResult =
+          context.result.isValid === false && context.result.invalidReason === "mismatch";
+      });
+      facilitator.onVerifyFailure(onVerifyFailure);
+
+      const result = await facilitator.verify(buildPaymentPayload(), buildPaymentRequirements());
+
+      expect(result.isValid).toBe(false);
+      expect(result.invalidReason).toBe("mismatch");
+      expect(sawInvalidResult).toBe(true);
+      expect(onVerifyFailure).not.toHaveBeenCalled();
+    });
+
     it("should execute hook when verification fails", async () => {
       const facilitator = new x402Facilitator();
 

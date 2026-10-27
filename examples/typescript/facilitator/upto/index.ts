@@ -20,7 +20,7 @@ import { toFacilitatorEvmSigner } from "@x402/evm";
 import { UptoEvmScheme } from "@x402/evm/upto/facilitator";
 import { toFacilitatorSvmSigner } from "@x402/svm";
 import {
-  InMemoryUptoChannelStorage,
+  InMemoryPaymentChannelStorage,
   UptoSvmRentCleanupManager,
   UptoSvmScheme,
 } from "@x402/svm/upto/facilitator";
@@ -61,7 +61,7 @@ const maxChannelLifetimeSecs = Number.parseInt(
   10,
 );
 
-const channelStorage = new InMemoryUptoChannelStorage();
+const channelStorage = new InMemoryPaymentChannelStorage();
 const facilitator = new x402Facilitator()
   .onBeforeVerify(async (context) => {
     console.log("Before verify", context);
@@ -148,11 +148,13 @@ if (svmPrivateKey) {
   );
   console.info(`SVM Facilitator account: ${svmAccount.address}`);
 
-  const svmSigner = toFacilitatorSvmSigner(svmAccount);
+  const svmSigner = toFacilitatorSvmSigner(
+    svmAccount,
+    svmRpcUrl ? { defaultRpcUrl: svmRpcUrl } : undefined,
+  );
   const svmUptoScheme = new UptoSvmScheme(svmSigner, {
     channelStorage,
     maxChannelLifetimeSecs,
-    rpcUrl: svmRpcUrl,
   });
   facilitator.register(SVM_NETWORK, svmUptoScheme);
 

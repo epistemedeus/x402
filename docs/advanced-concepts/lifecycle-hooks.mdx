@@ -12,10 +12,10 @@ Hooks allow you to intercept and modify payment lifecycle events on clients, ser
 Register hooks on the core resource server for verification and settlement lifecycle events. Use cases include logging payments, recording analytics, implementing custom access control or recovering from transient failures.
 
 * **onBeforeVerify** — Runs before payment verification. Return `{ abort: true, reason }` to reject, or `{ skip: true, result }` to use a locally produced verification result.
-* **onAfterVerify** — Runs after successful verification. Return `{ skipHandler: true, response? }` to settle without invoking the resource handler, or `{ abort: true, reason, message? }` to reject the payment after verification. When a hook aborts, `onVerifiedPaymentCanceled` is dispatched so schemes can clear any reserved state.
-* **onVerifyFailure** — Runs on verification failure. Return `{ recovered: true, result }` to override.
+* **onAfterVerify** — Runs after verification returns a result, including a facilitator response with `isValid: false`. Return `{ skipHandler: true, response? }` to settle without invoking the resource handler, or `{ abort: true, reason, message? }` to reject the payment after verification. When a hook aborts, `onVerifiedPaymentCanceled` is dispatched so schemes can clear any reserved state.
+* **onVerifyFailure** — Runs when verification throws. It does not run for a facilitator response with `isValid: false`. Return `{ recovered: true, result }` to override.
 * **onBeforeSettle** — Runs before settlement. Return `{ abort: true, reason }` to reject, or `{ skip: true, result }` to use a locally produced settlement result.
-* **onAfterSettle** — Runs after successful settlement.
+* **onAfterSettle** — Runs after successful settlement. Returning an `AfterSettleAbortError` (Go: `x402.NewAfterSettleAbort(reason, message)`) fails the settle closed — the response reports `success: false` while preserving the transaction hash, amount, payer, and any onchain extra. Use this when the onchain transaction confirmed but a critical post-settle step (such as persisting a voucher) failed and you want to surface the failure to the client. All other errors from this hook are non-fatal and are logged.
 * **onSettleFailure** — Runs on settlement failure. Return `{ recovered: true, result }` to override.
 * **onVerifiedPaymentCanceled** — Runs when a verified payment is not settled. Triggered when the protected handler throws or returns an error response (`handler_threw`, `handler_failed`), or when an `onAfterVerify` hook aborts (`after_verify_aborted`).
 
@@ -43,6 +43,21 @@ The `escrow` payment flow settles twice — once before the handler and once aft
         payer: context.result.payer,
       });
     });
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    async def send_receipt_on_final_charge(context):
+        # Only send receipt on the final charge, not the escrow deposit
+        if context.phase != "after-handler":
+            return
+
+        await send_receipt(
+            transaction=context.result.transaction,
+            payer=context.result.payer,
+        )
+
+    server.on_after_settle(send_receipt_on_final_charge)
     ```
   </Tab>
   <Tab title="Go">
@@ -350,8 +365,12 @@ Register hooks for HTTP-specific payment required handling. Use cases include tr
 
 Register hooks on the facilitator for verification and settlement lifecycle events. Use cases include populating a bazaar discovery catalog, compliance checks or collecting metrics across all processed payments.
 
-* **onBeforeVerify / onAfterVerify / onVerifyFailure** — Same pattern as server hooks.
-* **onBeforeSettle / onAfterSettle / onSettleFailure** — Same pattern as server hooks.
+* **onBeforeVerify** — Runs before payment verification. Return `{ abort: true, reason }` to reject.
+* **onAfterVerify** — Runs after verification returns a result, including when verify returns `isValid: false`. A thrown verification error uses `onVerifyFailure` instead.
+* **onVerifyFailure** — Runs when verification throws. It does not run for a result with `isValid: false` — use `onAfterVerify` for that case. Return `{ recovered: true, result }` to override.
+* **onBeforeSettle** — Runs before settlement. Return `{ abort: true, reason }` to reject.
+* **onAfterSettle** — Runs after successful settlement.
+* **onSettleFailure** — Runs on settlement failure. Return `{ recovered: true, result }` to override.
 
 <Tabs>
   <Tab title="TypeScript">
@@ -452,28 +471,58 @@ Register hooks on the MCP client for payment lifecycle events specific to tool c
 * **onBeforePayment** — Runs after payment approval but before the payment payload is created.
 * **onAfterPayment** — Runs after the payment payload is submitted and the tool result is received.
 
-```typescript
-import { x402MCPClient } from "@x402/mcp";
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    import { x402MCPClient } from "@x402/mcp";
 
-const client = new x402MCPClient(mcpClient, paymentClient);
+    const client = new x402MCPClient(mcpClient, paymentClient);
 
-client
-  .onPaymentRequired(async ({ toolName, paymentRequired }) => {
-    if (blocklist.has(toolName)) {
-      return { abort: true };
-    }
-    // Return undefined to proceed with normal payment flow
-  })
-  .onBeforePayment(async ({ toolName, paymentRequired }) => {
-    console.log(`Creating payment for tool: ${toolName}`);
-  })
-  .onAfterPayment(async ({ toolName, paymentPayload, result, settleResponse }) => {
-    await auditLog.record({
-      tool: toolName,
-      transaction: settleResponse?.transaction,
-    });
-  });
-```
+    client
+      .onPaymentRequired(async ({ toolName, paymentRequired }) => {
+        if (blocklist.has(toolName)) {
+          return { abort: true };
+        }
+        // Return undefined to proceed with normal payment flow
+      })
+      .onBeforePayment(async ({ toolName, paymentRequired }) => {
+        console.log(`Creating payment for tool: ${toolName}`);
+      })
+      .onAfterPayment(async ({ toolName, paymentPayload, result, settleResponse }) => {
+        await auditLog.record({
+          tool: toolName,
+          transaction: settleResponse?.transaction,
+        });
+      });
+    ```
+  </Tab>
+  <Tab title="Go">
+    ```go
+    import x402mcp "github.com/x402-foundation/x402/go/v2/mcp"
+
+    client := x402mcp.NewX402MCPClient(session, paymentClient, x402mcp.Options{})
+
+    client.
+      OnPaymentRequired(func(ctx x402mcp.PaymentRequiredContext) (*x402mcp.PaymentRequiredHookResult, error) {
+        if blocklist[ctx.ToolName] {
+          return &x402mcp.PaymentRequiredHookResult{Abort: true}, nil
+        }
+        // Return nil to proceed with normal payment flow
+        return nil, nil
+      }).
+      OnBeforePayment(func(ctx x402mcp.PaymentRequiredContext) error {
+        log.Printf("Creating payment for tool: %s", ctx.ToolName)
+        return nil
+      }).
+      OnAfterPayment(func(ctx x402mcp.AfterPaymentContext) error {
+        if ctx.SettleResponse != nil {
+          return auditLog.Record(ctx.ToolName, ctx.SettleResponse.Transaction)
+        }
+        return nil
+      })
+    ```
+  </Tab>
+</Tabs>
 
 ### x402MCPServer payment wrapper (MCP server)
 
@@ -483,26 +532,60 @@ Register hooks in the `PaymentWrapperConfig.hooks` object when creating a paymen
 * **onAfterExecution** — Runs after the tool handler returns, before settlement.
 * **onAfterSettlement** — Runs after successful payment settlement.
 
-```typescript
-import { createPaymentWrapper } from "@x402/mcp";
+<Tabs>
+  <Tab title="TypeScript">
+    ```typescript
+    import { createPaymentWrapper } from "@x402/mcp";
 
-const paid = createPaymentWrapper(resourceServer, {
-  accepts,
-  hooks: {
-    onBeforeExecution: async ({ toolName, paymentPayload }) => {
-      if (await isRateLimited(paymentPayload.payer)) {
-        return false; // Abort execution
+    const paid = createPaymentWrapper(resourceServer, {
+      accepts,
+      hooks: {
+        onBeforeExecution: async ({ toolName, paymentPayload }) => {
+          if (await isRateLimited(paymentPayload.payer)) {
+            return false; // Abort execution
+          }
+        },
+        onAfterExecution: async ({ toolName, result }) => {
+          console.log(`Tool ${toolName} executed successfully`);
+        },
+        onAfterSettlement: async ({ settlement }) => {
+          await sendReceipt({ transaction: settlement.transaction });
+        },
+      },
+    });
+    ```
+  </Tab>
+  <Tab title="Go">
+    ```go
+    import x402mcp "github.com/x402-foundation/x402/go/v2/mcp"
+
+    beforeExec := x402mcp.BeforeExecutionHook(func(ctx x402mcp.ServerHookContext) (bool, error) {
+      if isRateLimited(ctx.PaymentPayload.Payer) {
+        return false, nil // Abort execution
       }
-    },
-    onAfterExecution: async ({ toolName, result }) => {
-      console.log(`Tool ${toolName} executed successfully`);
-    },
-    onAfterSettlement: async ({ settlement }) => {
-      await sendReceipt({ transaction: settlement.transaction });
-    },
-  },
-});
-```
+      return true, nil
+    })
+
+    afterExec := x402mcp.AfterExecutionHook(func(ctx x402mcp.AfterExecutionContext) error {
+      log.Printf("Tool %s executed successfully", ctx.ToolName)
+      return nil
+    })
+
+    afterSettle := x402mcp.AfterSettlementHook(func(ctx x402mcp.SettlementContext) error {
+      return sendReceipt(ctx.Settlement.Transaction)
+    })
+
+    wrapper := x402mcp.NewPaymentWrapper(resourceServer, x402mcp.PaymentWrapperConfig{
+      Accepts: accepts,
+      Hooks: &x402mcp.PaymentWrapperHooks{
+        OnBeforeExecution: &beforeExec,
+        OnAfterExecution:  &afterExec,
+        OnAfterSettlement: &afterSettle,
+      },
+    })
+    ```
+  </Tab>
+</Tabs>
 
 ## Hook Chaining
 
